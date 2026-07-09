@@ -1,0 +1,19 @@
+# Dependencies for the decoupled `wireless_twin` framework (baseline path_field
+# backend). Cross-platform: Linux and Windows, CPU or CUDA.
+#
+# Install (CPU or existing CUDA torch):
+#   pip install -r requirements-twin.txt
+#
+# For a CUDA build of torch, follow https://pytorch.org/get-started/locally/
+# and install torch separately first.
+#
+# NOTE: the optional `wrfgs` (3D-GS) backend additionally needs the CUDA
+# rasteriser submodules in ../submodules — see INSTALL.md. Not required for the
+# baseline.
+
+numpy>=1.23
+torch>=2.0
+pyyaml>=6.0        # config files (.yaml)
+plyfile>=0.7       # optional: faster/robust .ply map loading
+tqdm>=4.64         # optional: progress bars
+pytest>=7.0        # optional: run tests/

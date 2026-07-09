@@ -1,0 +1,17 @@
+# Normalise line endings so the repo works identically on Linux and Windows.
+# Text files are stored with LF in git and checked out natively per-platform.
+* text=auto eol=lf
+
+# Windows batch/PowerShell scripts must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets — never munge.
+*.npy binary
+*.ply binary
+*.pt  binary
+*.pth binary
+*.png binary
+*.jpg binary
+*.pdf binary
