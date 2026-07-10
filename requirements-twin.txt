@@ -15,5 +15,6 @@ numpy>=1.23
 torch>=2.0
 pyyaml>=6.0        # config files (.yaml)
 plyfile>=0.7       # optional: faster/robust .ply map loading
+scipy>=1.9         # optional: map-context features (cKDTree)
 tqdm>=4.64         # optional: progress bars
 pytest>=7.0        # optional: run tests/

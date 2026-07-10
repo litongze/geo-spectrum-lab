@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from pathlib import Path
 
 import _bootstrap  # noqa: F401  (adds repo root to sys.path)
 
@@ -44,12 +45,14 @@ def main() -> None:
     ckpt = args.ckpt or out_cfg.get("ckpt", "checkpoints/model.pt")
     scaler_mode = data_cfg.get("scaler_mode", "std")
     use_geo = bool(data_cfg.get("use_bs_geometry", False))
+    use_map = bool(data_cfg.get("use_map_features", False))
 
     set_seed(int(train_cfg.get("seed", 0)))
 
-    print(f"[train] loading round from {datadir} (bs_geometry={use_geo})")
+    print(f"[train] loading round from {datadir} "
+          f"(bs_geometry={use_geo}, map_features={use_map})")
     rd = load_round(datadir, scaler_mode=scaler_mode, load_test=False,
-                    use_bs_geometry=use_geo)
+                    use_bs_geometry=use_geo, use_map_features=use_map)
     print(f"[train] {rd.round_tag}: {rd.spec}")
     print(f"[train] train positions: {len(rd.train)} | input dim: {rd.in_dim}")
 
@@ -74,6 +77,8 @@ def main() -> None:
         "pos_std": rd.pos_std.tolist(),
         "round_tag": rd.round_tag,
         "use_bs_geometry": use_geo,
+        "use_map_features": use_map,
+        "map_file": str(Path(datadir) / f"{rd.round_tag}_Map.ply") if use_map else None,
     }
 
     trainer = Trainer(model, rd.train, tcfg, checkpoint_meta=meta)

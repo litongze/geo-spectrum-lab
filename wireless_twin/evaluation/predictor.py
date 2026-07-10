@@ -15,6 +15,8 @@ import numpy as np
 import torch
 
 from ..data.augment import augment_positions
+from ..data.map_features import compute_map_features
+from ..data.map_loader import load_point_cloud
 from ..data.normalization import ChannelScaler
 from ..data.setup_config import ChannelSpec
 from ..models.base import ChannelModel
@@ -50,9 +52,14 @@ def predict_test_channels(
     pos_std = np.asarray(meta["pos_std"], dtype=np.float32)
     scaler = ChannelScaler().load_state_dict(meta["scaler"])
 
+    bs = meta["spec"]["bs_position"]
     feats = positions_raw.astype(np.float32)
     if meta.get("use_bs_geometry"):
-        feats = augment_positions(feats, meta["spec"]["bs_position"])
+        feats = augment_positions(feats, bs)
+    if meta.get("use_map_features"):
+        points = load_point_cloud(meta["map_file"])
+        feats = np.concatenate(
+            [feats, compute_map_features(positions_raw, bs, points)], axis=1)
     pos_norm = (feats - pos_mean) / pos_std
 
     outputs = []

@@ -22,8 +22,19 @@ import torch
 from torch.utils.data import Dataset
 
 from .augment import AUGMENTED_DIM, augment_positions
+from .map_features import compute_map_features
+from .map_loader import load_point_cloud
 from .normalization import ChannelScaler, complex_to_ri
 from .setup_config import ChannelSpec, load_setup
+
+
+def build_features(pos, spec, use_bs_geometry, points=None):
+    """Assemble the model input: [geometry|raw] (+ map features) for ``pos``."""
+    feats = augment_positions(pos, spec.bs_position) if use_bs_geometry else pos
+    if points is not None:
+        mf = compute_map_features(pos, spec.bs_position, points)
+        feats = np.concatenate([feats, mf], axis=1)
+    return feats.astype(np.float32)
 
 
 def detect_round(datadir: Union[str, Path]) -> str:
@@ -93,6 +104,7 @@ class RoundData:
     pos_mean: np.ndarray
     pos_std: np.ndarray
     use_bs_geometry: bool = False
+    use_map_features: bool = False
     in_dim: int = 3
 
     def normalize_positions(self, pos: np.ndarray) -> np.ndarray:
@@ -105,6 +117,7 @@ def load_round(
     scaler_mode: str = "std",
     load_test: bool = True,
     use_bs_geometry: bool = False,
+    use_map_features: bool = False,
 ) -> RoundData:
     """Load a full competition round from ``datadir``.
 
@@ -120,10 +133,13 @@ def load_round(
     train_pos = np.load(datadir / f"{tag}_Train_Pos.npy").astype(np.float32)
     train_ch = np.load(datadir / f"{tag}_Train_Channel.npy")
 
-    # Optionally augment raw coordinates with BS-relative geometry.
-    train_feat = (augment_positions(train_pos, spec.bs_position)
-                  if use_bs_geometry else train_pos)
-    in_dim = AUGMENTED_DIM if use_bs_geometry else 3
+    # Optionally augment with BS-relative geometry and/or map-context features.
+    points = None
+    if use_map_features:
+        points = load_point_cloud(datadir / f"{tag}_Map.ply")
+
+    train_feat = build_features(train_pos, spec, use_bs_geometry, points)
+    in_dim = train_feat.shape[1]
 
     pos_mean = train_feat.mean(axis=0)
     pos_std = train_feat.std(axis=0) + 1e-8
@@ -138,8 +154,7 @@ def load_round(
     test_path = datadir / f"{tag}_Test_Pos.npy"
     if load_test and test_path.exists():
         test_pos = np.load(test_path).astype(np.float32)
-        test_feat = (augment_positions(test_pos, spec.bs_position)
-                     if use_bs_geometry else test_pos)
+        test_feat = build_features(test_pos, spec, use_bs_geometry, points)
         test_ds = ChannelDataset((test_feat - pos_mean) / pos_std, None, scaler)
 
     return RoundData(
@@ -152,5 +167,6 @@ def load_round(
         pos_mean=pos_mean,
         pos_std=pos_std,
         use_bs_geometry=use_bs_geometry,
+        use_map_features=use_map_features,
         in_dim=in_dim,
     )
