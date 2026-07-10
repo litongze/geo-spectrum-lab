@@ -1,0 +1,28 @@
+# Round 1 — physics-structured ScatterField model (map-grounded, GPU).
+data:
+  datadir: "Round1_Map(2)"
+  scaler_mode: std
+
+model:
+  name: scatter_field
+  n_scatterers: 2048        # candidate scatterers sampled from the point cloud
+  kappa_init: 1.0e-4        # delay->subcarrier-phase constant (learned)
+  amp_power: 1.0            # geometric amplitude 1/(d_ue*d_bs)^power
+
+train:
+  epochs: 200
+  batch_size: 64
+  lr: 3.0e-3
+  weight_decay: 0.0
+  lambda_pas: 1.0
+  lambda_pdp: 1.0
+  lambda_mag: 0.0
+  val_fraction: 0.1
+  grad_clip: 1.0
+  num_workers: 0
+  log_every: 20
+  seed: 0
+  device: cuda
+
+output:
+  ckpt: checkpoints/round1_scatter.pt

@@ -82,6 +82,11 @@ class Trainer:
             self.model.parameters(), lr=config.lr,
             weight_decay=config.weight_decay)
 
+        # best-by-validation-C snapshot (val peaks mid-training then overfits)
+        self.best_score = -1.0
+        self.best_epoch = -1
+        self.best_state = None
+
     # ------------------------------------------------------------------
     def _run_batch(self, pos: torch.Tensor, target: torch.Tensor,
                    train: bool) -> Dict[str, float]:
@@ -115,8 +120,16 @@ class Trainer:
                     agg[k] = agg.get(k, 0.0) + v * bs
         return {k: v / max(n, 1) for k, v in agg.items()}
 
+    def _val_score(self, val_stats: Dict[str, float]) -> float:
+        """Competition metric C on the validation split (higher is better)."""
+        w1, w2, w3 = self.spec.metric_weights
+        return (w1 * val_stats.get("pas", 0.0)
+                + w2 * val_stats.get("pdp", 0.0)
+                + w3 / (1.0 + val_stats.get("nmse", 1.0)))
+
     def fit(self) -> List[Dict[str, float]]:
         history: List[Dict[str, float]] = []
+        import copy
         for epoch in range(1, self.config.epochs + 1):
             train_stats = self._epoch(self.train_loader, train=True)
             record = {"epoch": epoch, **{f"train_{k}": v
@@ -124,11 +137,21 @@ class Trainer:
             if self.val_loader is not None:
                 val_stats = self._epoch(self.val_loader, train=False)
                 record.update({f"val_{k}": v for k, v in val_stats.items()})
+                # keep the best-by-validation-C weights (val peaks then overfits)
+                score = self._val_score(val_stats)
+                if score > self.best_score:
+                    self.best_score = score
+                    self.best_epoch = epoch
+                    self.best_state = copy.deepcopy(
+                        {k: v.cpu() for k, v in self.model.state_dict().items()})
             history.append(record)
 
             if epoch == 1 or epoch % self.config.log_every == 0 \
                     or epoch == self.config.epochs:
                 self._log(record)
+        if self.best_state is not None:
+            print(f"[trainer] best val C={self.best_score:.4f} @ epoch "
+                  f"{self.best_epoch}", flush=True)
         return history
 
     @staticmethod
@@ -144,9 +167,11 @@ class Trainer:
     def save_checkpoint(self, path: Union[str, Path]) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "model_state": self.model.state_dict(),
-            "meta": self.checkpoint_meta,
-        }
+        # prefer the best-by-validation weights over the (overfit) final ones
+        state = self.best_state if self.best_state is not None \
+            else self.model.state_dict()
+        payload = {"model_state": state, "meta": self.checkpoint_meta}
         torch.save(payload, str(path))
-        print(f"[trainer] saved checkpoint -> {path}", flush=True)
+        tag = (f" (best val C={self.best_score:.4f} @ ep{self.best_epoch})"
+               if self.best_state is not None else "")
+        print(f"[trainer] saved checkpoint -> {path}{tag}", flush=True)

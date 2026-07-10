@@ -118,6 +118,7 @@ def load_round(
     load_test: bool = True,
     use_bs_geometry: bool = False,
     use_map_features: bool = False,
+    standardize: bool = True,
 ) -> RoundData:
     """Load a full competition round from ``datadir``.
 
@@ -141,8 +142,13 @@ def load_round(
     train_feat = build_features(train_pos, spec, use_bs_geometry, points)
     in_dim = train_feat.shape[1]
 
-    pos_mean = train_feat.mean(axis=0)
-    pos_std = train_feat.std(axis=0) + 1e-8
+    if standardize:
+        pos_mean = train_feat.mean(axis=0)
+        pos_std = train_feat.std(axis=0) + 1e-8
+    else:
+        # feed raw coordinates (physics models compute their own geometry)
+        pos_mean = np.zeros(in_dim, dtype=np.float32)
+        pos_std = np.ones(in_dim, dtype=np.float32)
 
     scaler = ChannelScaler(mode=scaler_mode).fit(train_ch)
 

@@ -39,8 +39,10 @@ def build_model(name: str, spec: ChannelSpec, **kwargs) -> ChannelModel:
 
 # --- register built-in backends -----------------------------------------
 from .path_field import PathFieldModel  # noqa: E402
+from .scatter_field import ScatterFieldModel  # noqa: E402
 
 register_model("path_field")(PathFieldModel)
+register_model("scatter_field")(ScatterFieldModel)
 
 # The 3D-GS backend is optional (needs CUDA rasteriser); register it lazily so
 # importing the package never fails when the submodules aren't built.

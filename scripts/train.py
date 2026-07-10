@@ -14,9 +14,12 @@ import argparse
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
+
 import _bootstrap  # noqa: F401  (adds repo root to sys.path)
 
 from wireless_twin.data import load_round
+from wireless_twin.data.map_loader import load_point_cloud
 from wireless_twin.models import available_models, build_model
 from wireless_twin.training import TrainConfig, Trainer
 from wireless_twin.utils import load_config, merge_overrides, set_seed
@@ -47,21 +50,33 @@ def main() -> None:
     use_geo = bool(data_cfg.get("use_bs_geometry", False))
     use_map = bool(data_cfg.get("use_map_features", False))
 
-    set_seed(int(train_cfg.get("seed", 0)))
-
-    print(f"[train] loading round from {datadir} "
-          f"(bs_geometry={use_geo}, map_features={use_map})")
-    rd = load_round(datadir, scaler_mode=scaler_mode, load_test=False,
-                    use_bs_geometry=use_geo, use_map_features=use_map)
-    print(f"[train] {rd.round_tag}: {rd.spec}")
-    print(f"[train] train positions: {len(rd.train)} | input dim: {rd.in_dim}")
-
     model_name = model_cfg.pop("name", "path_field")
     if model_name not in available_models():
         raise SystemExit(
             f"model '{model_name}' not available. Have: {available_models()}")
+    # physics models (scatter_field) consume raw coordinates, not standardised
+    standardize = model_name != "scatter_field"
+
+    set_seed(int(train_cfg.get("seed", 0)))
+
+    print(f"[train] loading round from {datadir} "
+          f"(bs_geometry={use_geo}, map_features={use_map}, std={standardize})")
+    rd = load_round(datadir, scaler_mode=scaler_mode, load_test=False,
+                    use_bs_geometry=use_geo, use_map_features=use_map,
+                    standardize=standardize)
+    print(f"[train] {rd.round_tag}: {rd.spec}")
+    print(f"[train] train positions: {len(rd.train)} | input dim: {rd.in_dim}")
+
     model_cfg["in_dim"] = rd.in_dim
     model = build_model(model_name, rd.spec, **model_cfg)
+
+    # scatter_field needs its scatterer cloud loaded into the model buffers
+    if model_name == "scatter_field":
+        pts = load_point_cloud(Path(datadir) / f"{rd.round_tag}_Map.ply")
+        rng = np.random.default_rng(int(train_cfg.get("seed", 0)))
+        idx = rng.choice(len(pts), size=model.k, replace=len(pts) < model.k)
+        model.set_scatterers(pts[idx])
+        print(f"[train] scatter_field: {model.k} scatterers from {len(pts)} pts")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] model '{model_name}' with {n_params/1e6:.2f}M parameters")
 
