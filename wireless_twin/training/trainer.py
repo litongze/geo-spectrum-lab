@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, random_split
 
 from ..data.channel_dataset import ChannelDataset
 from ..models.base import ChannelModel
-from .losses import ChannelLoss
+from .losses import build_loss
 
 
 @dataclass
@@ -26,6 +26,8 @@ class TrainConfig:
     batch_size: int = 64
     lr: float = 1e-3
     weight_decay: float = 0.0
+    loss_name: str = "competition"
+    aug_noise_std: float = 0.0   # per-step complex-Gaussian noise on the target
     lambda_pas: float = 1.0
     lambda_pdp: float = 1.0
     lambda_mag: float = 1.0
@@ -55,9 +57,10 @@ class Trainer:
             config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = model.to(self.device)
         self.spec = model.spec
-        self.criterion = ChannelLoss(
-            self.spec, config.lambda_pas, config.lambda_pdp,
-            config.lambda_mag).to(self.device)
+        self.criterion = build_loss(
+            config.loss_name, self.spec,
+            lambda_pas=config.lambda_pas, lambda_pdp=config.lambda_pdp,
+            lambda_mag=config.lambda_mag).to(self.device)
         self.checkpoint_meta = checkpoint_meta or {}
 
         # train / val split for monitoring
@@ -93,6 +96,12 @@ class Trainer:
         pos = pos.to(self.device)
         target = target.to(self.device)
         gt_h = _ri_to_complex(target, self.spec.m, self.spec.n, self.spec.s)
+
+        # data augmentation: fresh complex-Gaussian noise on the target each step
+        if train and self.config.aug_noise_std > 0:
+            sigma = self.config.aug_noise_std * gt_h.abs().mean()
+            noise = torch.randn_like(gt_h.real) + 1j * torch.randn_like(gt_h.imag)
+            gt_h = gt_h + sigma * noise / (2 ** 0.5)
 
         pred_h = self.model(pos)
         out = self.criterion(pred_h, gt_h)

@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from ..data.setup_config import ChannelSpec
 from .base import ChannelModel
+from .encodings import FourierFeatures
 
 
 class _ComplexVec(nn.Module):
@@ -52,12 +53,16 @@ class ScatterFieldModel(ChannelModel):
         kappa_init: float = 1e-3,
         amp_power: float = 1.0,
         n_freq_basis: int = 0,   # >0 adds a learned per-scatterer freq envelope
+        scatter_dropout: float = 0.0,  # train-time fraction of scatterers dropped
+        n_vis_rank: int = 0,     # >0 adds a low-rank UE-dependent visibility gate
         in_dim: int = 3,   # accepted for API symmetry; raw xyz expected
     ) -> None:
         super().__init__(spec)
         self.k = n_scatterers
         self.amp_power = amp_power
         self.n_freq_basis = n_freq_basis
+        self.scatter_dropout = scatter_dropout
+        self.n_vis_rank = n_vis_rank
         m, n, s = spec.m, spec.n, spec.s
 
         # scatterer positions (buffer -> saved/restored with the model)
@@ -80,6 +85,16 @@ class ScatterFieldModel(ChannelModel):
         self.v = _ComplexVec(self.k, n)       # UE array signature
         self.log_kappa = nn.Parameter(torch.tensor(float(np.log(kappa_init))))
         self.log_gain = nn.Parameter(torch.zeros(()))
+
+        # optional low-rank UE-dependent visibility gate (grafts NeRF2's
+        # occlusion modelling: vis(x,k) = sigmoid(f(x) . g_k) in [0,1])
+        if n_vis_rank > 0:
+            self.enc_vis = FourierFeatures(3, n_freqs=6, include_input=True)
+            self.vis_mlp = nn.Sequential(
+                nn.Linear(self.enc_vis.out_dim, 128), nn.ReLU(inplace=True),
+                nn.Linear(128, n_vis_rank))
+            self.vis_g = nn.Parameter(torch.randn(self.k, n_vis_rank) * 0.1)
+            self.coord_scale = float(max(np.abs(spec.bs_position)) * 4 + 200)
 
         # optional learned per-scatterer frequency envelope (low-rank, shared)
         if n_freq_basis > 0:
@@ -106,6 +121,16 @@ class ScatterFieldModel(ChannelModel):
 
         a = self.a()                                                   # (K,)
         g = amp.to(a.dtype) * a[None, :]                               # (B,K) complex
+        # grafted visibility gate (UE-dependent occlusion, low-rank)
+        if self.n_vis_rank > 0:
+            f = self.vis_mlp(self.enc_vis(positions / self.coord_scale))  # (B,R)
+            vis = torch.sigmoid(f @ self.vis_g.t())                    # (B,K) in [0,1]
+            g = g * vis.to(g.dtype)
+        # scatterer dropout: randomly silence a fraction each step (regulariser)
+        if self.training and self.scatter_dropout > 0:
+            keep = 1.0 - self.scatter_dropout
+            mask = (torch.rand(self.k, device=g.device) < keep).to(g.real.dtype)
+            g = g * (mask / keep)[None, :]
         # delay phase ramp: exp(-i 2pi kappa tau s)
         kappa = torch.exp(self.log_kappa)
         phase = (-2 * np.pi * kappa) * (tau[:, :, None] * self.s_idx[None, None, :])

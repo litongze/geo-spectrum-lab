@@ -81,4 +81,6 @@ def cosine_similarity_along_last(pred: torch.Tensor, gt: torch.Tensor) -> torch.
     num = (pred * gt).sum(dim=-1)
     den = pred.norm(dim=-1) * gt.norm(dim=-1)
     den = torch.clamp_min(den, torch.finfo(den.dtype).tiny)
-    return (num / den).mean()
+    # Cauchy-Schwarz: a true cosine is in [-1, 1]; clamp guards float underflow
+    # on near-zero spectra (e.g. a degenerate model) from exploding the ratio.
+    return (num / den).clamp(-1.0, 1.0).mean()

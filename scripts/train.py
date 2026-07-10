@@ -54,8 +54,8 @@ def main() -> None:
     if model_name not in available_models():
         raise SystemExit(
             f"model '{model_name}' not available. Have: {available_models()}")
-    # physics models (scatter_field) consume raw coordinates, not standardised
-    standardize = model_name != "scatter_field"
+    # physics models consume raw coordinates (they compute their own geometry)
+    standardize = model_name not in ("scatter_field", "nerf2")
 
     set_seed(int(train_cfg.get("seed", 0)))
 

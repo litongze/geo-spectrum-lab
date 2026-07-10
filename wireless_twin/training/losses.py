@@ -67,3 +67,58 @@ class ChannelLoss(nn.Module):
             "pas": c1.detach(),
             "pdp": c2.detach(),
         }
+
+
+def _diagnostics(pred_h: torch.Tensor, gt_h: torch.Tensor,
+                 spec: ChannelSpec) -> dict:
+    """The three competition metrics, detached (for logging any loss)."""
+    with torch.no_grad():
+        return {
+            "nmse": nmse(pred_h, gt_h).detach(),
+            "pas": cosine_similarity_along_last(
+                pas_spectrum(pred_h, spec), pas_spectrum(gt_h, spec)).detach(),
+            "pdp": cosine_similarity_along_last(
+                pdp_spectrum(pred_h, spec), pdp_spectrum(gt_h, spec)).detach(),
+        }
+
+
+class MseLoss(nn.Module):
+    """Pure complex MSE — the NeRF2 objective (``sig2mse``) applied to H."""
+
+    def __init__(self, spec: ChannelSpec, **_) -> None:
+        super().__init__()
+        self.spec = spec
+
+    def forward(self, pred_h, gt_h):
+        loss = ((pred_h - gt_h).abs() ** 2).mean()
+        return {"loss": loss, **_diagnostics(pred_h, gt_h, self.spec)}
+
+
+class L1Loss(nn.Module):
+    """Complex L1 — analogue of the WRF-GS reconstruction term (sans SSIM)."""
+
+    def __init__(self, spec: ChannelSpec, **_) -> None:
+        super().__init__()
+        self.spec = spec
+
+    def forward(self, pred_h, gt_h):
+        loss = (pred_h - gt_h).abs().mean()
+        return {"loss": loss, **_diagnostics(pred_h, gt_h, self.spec)}
+
+
+# --- loss registry (loss is swappable per "method", like the model) --------
+_LOSS_REGISTRY = {
+    "competition": ChannelLoss,   # PAS/PDP consistency + magnitude (aligned to C)
+    "mse": MseLoss,               # NeRF2-style pure MSE
+    "l1": L1Loss,                 # WRF-GS-style L1 reconstruction
+}
+
+
+def build_loss(name: str, spec: ChannelSpec, **kwargs) -> nn.Module:
+    if name not in _LOSS_REGISTRY:
+        raise KeyError(f"unknown loss '{name}'. Have: {list(_LOSS_REGISTRY)}")
+    return _LOSS_REGISTRY[name](spec, **kwargs)
+
+
+def available_losses():
+    return sorted(_LOSS_REGISTRY)
