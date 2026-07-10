@@ -66,14 +66,19 @@ def pdp_spectrum(h: torch.Tensor, spec: ChannelSpec) -> torch.Tensor:
     return hd.real ** 2 + hd.imag ** 2
 
 
-def cosine_similarity_along_last(pred: torch.Tensor, gt: torch.Tensor,
-                                 eps: float = 1e-12) -> torch.Tensor:
+def cosine_similarity_along_last(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """Mean cosine similarity between vectors on the last axis.
 
     ``pred`` and ``gt`` share shape ``(..., L)``.  Cosine similarity is computed
     per length-``L`` vector and averaged over every leading axis, matching the
     task book's "average over all positions / antennas / sub-carriers".
+
+    Note: the denominator is floored at the dtype's smallest positive value
+    (not a fixed ``1e-12``) so the metric stays correct for *raw*-scale channels
+    whose power spectra are ~1e-13; a fixed eps would swamp the denominator and
+    collapse the cosine to zero.
     """
     num = (pred * gt).sum(dim=-1)
-    den = pred.norm(dim=-1) * gt.norm(dim=-1) + eps
+    den = pred.norm(dim=-1) * gt.norm(dim=-1)
+    den = torch.clamp_min(den, torch.finfo(den.dtype).tiny)
     return (num / den).mean()
