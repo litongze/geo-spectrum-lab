@@ -57,13 +57,15 @@ class PathFieldModel(ChannelModel):
         n_freqs: int = 10,
         hidden_dim: int = 256,
         n_layers: int = 4,
+        in_dim: int = 3,
     ) -> None:
         super().__init__(spec)
         self.k = n_paths
+        self.in_dim = in_dim
         m, n, s = spec.m, spec.n, spec.s
 
-        # --- position -> complex path gains c_k(x) -----------------------
-        self.encoder = FourierFeatures(3, n_freqs=n_freqs, include_input=True)
+        # --- position (or geometry-augmented) -> complex path gains ------
+        self.encoder = FourierFeatures(in_dim, n_freqs=n_freqs, include_input=True)
         layers = [nn.Linear(self.encoder.out_dim, hidden_dim), nn.ReLU(inplace=True)]
         for _ in range(n_layers - 1):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]

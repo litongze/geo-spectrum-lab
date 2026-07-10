@@ -14,6 +14,7 @@ from .setup_config import ChannelSpec, load_setup
 from .normalization import ChannelScaler
 from .channel_dataset import ChannelDataset, load_round
 from .map_loader import load_point_cloud
+from .augment import augment_positions, AUGMENTED_DIM
 
 __all__ = [
     "ChannelSpec",
@@ -22,4 +23,6 @@ __all__ = [
     "ChannelDataset",
     "load_round",
     "load_point_cloud",
+    "augment_positions",
+    "AUGMENTED_DIM",
 ]

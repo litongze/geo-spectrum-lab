@@ -28,6 +28,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     lambda_pas: float = 1.0
     lambda_pdp: float = 1.0
+    lambda_mag: float = 1.0
     val_fraction: float = 0.1
     grad_clip: float = 1.0
     num_workers: int = 0            # 0 is the safe cross-platform default
@@ -55,7 +56,8 @@ class Trainer:
         self.model = model.to(self.device)
         self.spec = model.spec
         self.criterion = ChannelLoss(
-            self.spec, config.lambda_pas, config.lambda_pdp).to(self.device)
+            self.spec, config.lambda_pas, config.lambda_pdp,
+            config.lambda_mag).to(self.device)
         self.checkpoint_meta = checkpoint_meta or {}
 
         # train / val split for monitoring

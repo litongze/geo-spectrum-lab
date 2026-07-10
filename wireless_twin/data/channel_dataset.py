@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .augment import AUGMENTED_DIM, augment_positions
 from .normalization import ChannelScaler, complex_to_ri
 from .setup_config import ChannelSpec, load_setup
 
@@ -91,6 +92,8 @@ class RoundData:
     round_tag: str
     pos_mean: np.ndarray
     pos_std: np.ndarray
+    use_bs_geometry: bool = False
+    in_dim: int = 3
 
     def normalize_positions(self, pos: np.ndarray) -> np.ndarray:
         """Standardise coordinates the same way the model was trained."""
@@ -101,6 +104,7 @@ def load_round(
     datadir: Union[str, Path],
     scaler_mode: str = "std",
     load_test: bool = True,
+    use_bs_geometry: bool = False,
 ) -> RoundData:
     """Load a full competition round from ``datadir``.
 
@@ -116,20 +120,27 @@ def load_round(
     train_pos = np.load(datadir / f"{tag}_Train_Pos.npy").astype(np.float32)
     train_ch = np.load(datadir / f"{tag}_Train_Channel.npy")
 
-    pos_mean = train_pos.mean(axis=0)
-    pos_std = train_pos.std(axis=0) + 1e-8
+    # Optionally augment raw coordinates with BS-relative geometry.
+    train_feat = (augment_positions(train_pos, spec.bs_position)
+                  if use_bs_geometry else train_pos)
+    in_dim = AUGMENTED_DIM if use_bs_geometry else 3
+
+    pos_mean = train_feat.mean(axis=0)
+    pos_std = train_feat.std(axis=0) + 1e-8
 
     scaler = ChannelScaler(mode=scaler_mode).fit(train_ch)
 
     train_ds = ChannelDataset(
-        (train_pos - pos_mean) / pos_std, train_ch, scaler)
+        (train_feat - pos_mean) / pos_std, train_ch, scaler)
 
     test_ds: Optional[ChannelDataset] = None
     test_pos: Optional[np.ndarray] = None
     test_path = datadir / f"{tag}_Test_Pos.npy"
     if load_test and test_path.exists():
         test_pos = np.load(test_path).astype(np.float32)
-        test_ds = ChannelDataset((test_pos - pos_mean) / pos_std, None, scaler)
+        test_feat = (augment_positions(test_pos, spec.bs_position)
+                     if use_bs_geometry else test_pos)
+        test_ds = ChannelDataset((test_feat - pos_mean) / pos_std, None, scaler)
 
     return RoundData(
         spec=spec,
@@ -140,4 +151,6 @@ def load_round(
         round_tag=tag,
         pos_mean=pos_mean,
         pos_std=pos_std,
+        use_bs_geometry=use_bs_geometry,
+        in_dim=in_dim,
     )

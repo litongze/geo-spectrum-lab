@@ -14,6 +14,7 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import torch
 
+from ..data.augment import augment_positions
 from ..data.normalization import ChannelScaler
 from ..data.setup_config import ChannelSpec
 from ..models.base import ChannelModel
@@ -49,7 +50,10 @@ def predict_test_channels(
     pos_std = np.asarray(meta["pos_std"], dtype=np.float32)
     scaler = ChannelScaler().load_state_dict(meta["scaler"])
 
-    pos_norm = (positions_raw.astype(np.float32) - pos_mean) / pos_std
+    feats = positions_raw.astype(np.float32)
+    if meta.get("use_bs_geometry"):
+        feats = augment_positions(feats, meta["spec"]["bs_position"])
+    pos_norm = (feats - pos_mean) / pos_std
 
     outputs = []
     model.eval()

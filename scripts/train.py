@@ -43,18 +43,21 @@ def main() -> None:
     datadir = args.datadir or data_cfg.get("datadir")
     ckpt = args.ckpt or out_cfg.get("ckpt", "checkpoints/model.pt")
     scaler_mode = data_cfg.get("scaler_mode", "std")
+    use_geo = bool(data_cfg.get("use_bs_geometry", False))
 
     set_seed(int(train_cfg.get("seed", 0)))
 
-    print(f"[train] loading round from {datadir}")
-    rd = load_round(datadir, scaler_mode=scaler_mode, load_test=False)
+    print(f"[train] loading round from {datadir} (bs_geometry={use_geo})")
+    rd = load_round(datadir, scaler_mode=scaler_mode, load_test=False,
+                    use_bs_geometry=use_geo)
     print(f"[train] {rd.round_tag}: {rd.spec}")
-    print(f"[train] train positions: {len(rd.train)}")
+    print(f"[train] train positions: {len(rd.train)} | input dim: {rd.in_dim}")
 
     model_name = model_cfg.pop("name", "path_field")
     if model_name not in available_models():
         raise SystemExit(
             f"model '{model_name}' not available. Have: {available_models()}")
+    model_cfg["in_dim"] = rd.in_dim
     model = build_model(model_name, rd.spec, **model_cfg)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] model '{model_name}' with {n_params/1e6:.2f}M parameters")
@@ -70,6 +73,7 @@ def main() -> None:
         "pos_mean": rd.pos_mean.tolist(),
         "pos_std": rd.pos_std.tolist(),
         "round_tag": rd.round_tag,
+        "use_bs_geometry": use_geo,
     }
 
     trainer = Trainer(model, rd.train, tcfg, checkpoint_meta=meta)

@@ -1,6 +1,8 @@
 # Competition data (provided separately, not committed) — root-level only,
 # so it does NOT match the wireless_twin/data package.
 /data/
+/Round*_Map*/
+/Round*/
 
 # Python
 __pycache__/

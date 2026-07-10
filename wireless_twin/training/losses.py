@@ -27,26 +27,38 @@ def nmse(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-12) -> torch.Tens
 
 
 class ChannelLoss(nn.Module):
-    """Composite NMSE + PAS/PDP-consistency loss over complex channels."""
+    """Composite magnitude + PAS/PDP-consistency loss over complex channels.
+
+    The PAS/PDP terms are cosine similarities (scale-invariant), so on their own
+    they let the model shrink its output magnitude toward zero (NMSE -> 1) while
+    still matching the *shape* of the spectra.  To also learn the magnitude we
+    add a direct MSE term (``lambda_mag``); because the cosine terms produce much
+    larger gradients when the prediction is small, ``lambda_mag`` usually needs
+    to be well above 1 to compete under Adam.
+    """
 
     def __init__(self, spec: ChannelSpec,
                  lambda_pas: float = 1.0,
-                 lambda_pdp: float = 1.0) -> None:
+                 lambda_pdp: float = 1.0,
+                 lambda_mag: float = 1.0) -> None:
         super().__init__()
         self.spec = spec
         self.lambda_pas = lambda_pas
         self.lambda_pdp = lambda_pdp
+        self.lambda_mag = lambda_mag
 
     def forward(self, pred_h: torch.Tensor, gt_h: torch.Tensor) -> dict:
         """``pred_h`` / ``gt_h`` are complex ``(B, M, N, S)`` tensors."""
         loss_nmse = nmse(pred_h, gt_h)
+        # element-wise MSE — a magnitude signal that does not vanish with scale
+        loss_mag = ((pred_h - gt_h).abs() ** 2).mean()
 
         c1 = cosine_similarity_along_last(
             pas_spectrum(pred_h, self.spec), pas_spectrum(gt_h, self.spec))
         c2 = cosine_similarity_along_last(
             pdp_spectrum(pred_h, self.spec), pdp_spectrum(gt_h, self.spec))
 
-        total = (loss_nmse
+        total = (self.lambda_mag * loss_mag
                  + self.lambda_pas * (1.0 - c1)
                  + self.lambda_pdp * (1.0 - c2))
         return {
