@@ -31,11 +31,15 @@ class TrainConfig:
     lambda_pas: float = 1.0
     lambda_pdp: float = 1.0
     lambda_mag: float = 1.0
+    lambda_magabs: float = 0.0
+    lambda_magdb: float = 0.0
     val_fraction: float = 0.1
     grad_clip: float = 1.0
     num_workers: int = 0            # 0 is the safe cross-platform default
     log_every: int = 10
     seed: int = 0
+    split_seed: int = -1            # <0: use `seed`; else fix the train/val split
+    swa_start_frac: float = 0.0     # >0: average weights over the last (1-frac) epochs
     device: Optional[str] = None    # "cuda" / "cpu" / None=auto
 
 
@@ -60,13 +64,16 @@ class Trainer:
         self.criterion = build_loss(
             config.loss_name, self.spec,
             lambda_pas=config.lambda_pas, lambda_pdp=config.lambda_pdp,
-            lambda_mag=config.lambda_mag).to(self.device)
+            lambda_mag=config.lambda_mag,
+            lambda_magabs=config.lambda_magabs,
+            lambda_magdb=config.lambda_magdb).to(self.device)
         self.checkpoint_meta = checkpoint_meta or {}
 
         # train / val split for monitoring
         n_val = int(len(train_set) * config.val_fraction)
         n_train = len(train_set) - n_val
-        gen = torch.Generator().manual_seed(config.seed)
+        split_seed = config.seed if config.split_seed < 0 else config.split_seed
+        gen = torch.Generator().manual_seed(split_seed)
         if n_val > 0:
             self.train_split, self.val_split = random_split(
                 train_set, [n_train, n_val], generator=gen)
@@ -139,6 +146,9 @@ class Trainer:
     def fit(self) -> List[Dict[str, float]]:
         history: List[Dict[str, float]] = []
         import copy
+        swa_start = (int(self.config.epochs * self.config.swa_start_frac)
+                     if self.config.swa_start_frac > 0 else None)
+        swa_state, swa_n = None, 0
         for epoch in range(1, self.config.epochs + 1):
             train_stats = self._epoch(self.train_loader, train=True)
             record = {"epoch": epoch, **{f"train_{k}": v
@@ -153,11 +163,34 @@ class Trainer:
                     self.best_epoch = epoch
                     self.best_state = copy.deepcopy(
                         {k: v.cpu() for k, v in self.model.state_dict().items()})
+            # SWA: running average of weights over the tail epochs -> flatter,
+            # better-generalising minimum (a single model, so no cross-model
+            # phase cancellation like a complex-domain ensemble suffers).
+            if swa_start is not None and epoch >= swa_start:
+                cur = {k: v.detach().cpu().float()
+                       for k, v in self.model.state_dict().items()}
+                if swa_state is None:
+                    swa_state, swa_n = cur, 1
+                else:
+                    swa_n += 1
+                    for k in swa_state:
+                        swa_state[k] += (cur[k] - swa_state[k]) / swa_n
             history.append(record)
 
             if epoch == 1 or epoch % self.config.log_every == 0 \
                     or epoch == self.config.epochs:
                 self._log(record)
+        # adopt the SWA average if it beats the best single snapshot on val
+        if swa_state is not None and self.val_loader is not None:
+            self.model.load_state_dict(
+                {k: v.to(self.device) for k, v in swa_state.items()})
+            swa_score = self._val_score(self._epoch(self.val_loader, train=False))
+            print(f"[trainer] SWA val C={swa_score:.4f} (n={swa_n}) vs "
+                  f"best single={self.best_score:.4f}", flush=True)
+            if swa_score > self.best_score:
+                self.best_score, self.best_epoch = swa_score, -2
+                self.best_state = {k: v.cpu() for k, v in swa_state.items()}
+                print("[trainer] adopting SWA weights", flush=True)
         if self.best_state is not None:
             print(f"[trainer] best val C={self.best_score:.4f} @ epoch "
                   f"{self.best_epoch}", flush=True)

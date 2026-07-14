@@ -55,6 +55,13 @@ class ScatterFieldModel(ChannelModel):
         n_freq_basis: int = 0,   # >0 adds a learned per-scatterer freq envelope
         scatter_dropout: float = 0.0,  # train-time fraction of scatterers dropped
         n_vis_rank: int = 0,     # >0 adds a low-rank UE-dependent visibility gate
+        learn_scatterers: bool = False,  # gradient-refine scatterer positions
+        structured_u: bool = False,  # geometric BS steering dictionary for U_k
+        n_mag_paths: int = 0,    # >0: independent magnitude head (normalized-dB)
+        mag_freqs: int = 8,
+        n_attn_heads: int = 0,   # >0: multi-head cross-attention visibility gate
+        attn_dim: int = 32,
+        u_rank: int = 0,         # >0: low-rank BS signature U=C@B (shared basis)
         in_dim: int = 3,   # accepted for API symmetry; raw xyz expected
     ) -> None:
         super().__init__(spec)
@@ -63,7 +70,18 @@ class ScatterFieldModel(ChannelModel):
         self.n_freq_basis = n_freq_basis
         self.scatter_dropout = scatter_dropout
         self.n_vis_rank = n_vis_rank
+        self.learn_scatterers = learn_scatterers
+        self.structured_u = structured_u
+        self.n_mag_paths = n_mag_paths
+        self.n_attn_heads = n_attn_heads
+        self.attn_dim = attn_dim
+        self.u_rank = u_rank
+        # extra input dims beyond xyz are ray-traced map-context features
+        # (LoS-to-BS blockage + directional openness) -> condition occlusion
+        self.map_dim = max(0, int(in_dim) - 3)
+        self._cscale = float(max(abs(v) for v in spec.bs_position) * 4 + 200)
         m, n, s = spec.m, spec.n, spec.s
+        self.mh, self.mv, self.mp = spec.mh, spec.mv, spec.mp
 
         # scatterer positions (buffer -> saved/restored with the model)
         if scatterers is None:
@@ -75,31 +93,90 @@ class ScatterFieldModel(ChannelModel):
         # BS<->scatterer distance is position-independent -> precompute
         self.register_buffer("d_bs", torch.linalg.norm(
             self.scatterers - self.bs, dim=1).clamp_min(1e-3))
+        if learn_scatterers:   # learnable offset from the point-cloud init
+            self.scat_offset = nn.Parameter(torch.zeros(n_scatterers, 3))
 
         # subcarrier index vector
         self.register_buffer("s_idx", torch.arange(s, dtype=torch.float32))
 
         # learned, environment-shared parameters
         self.a = _ComplexVec(self.k)          # complex reflectivity per scatterer
-        self.u = _ComplexVec(self.k, m)       # BS array signature
         self.v = _ComplexVec(self.k, n)       # UE array signature
         self.log_kappa = nn.Parameter(torch.tensor(float(np.log(kappa_init))))
         self.log_gain = nn.Parameter(torch.zeros(()))
+
+        # BS array signature U_k: either freely learned (K x M) or a structured
+        # geometric steering dictionary toward each scatterer (grafts the
+        # model-based / physics-informed INR idea: a steering-vector dictionary
+        # activated by learned coefficients -> strong regulariser).
+        if structured_u:
+            self.register_buffer("mh_idx", torch.arange(self.mh, dtype=torch.float32))
+            self.register_buffer("mv_idx", torch.arange(self.mv, dtype=torch.float32))
+            self.log_kappa_bs = nn.Parameter(torch.zeros(()))   # electrical size
+            self.pol = _ComplexVec(self.mp)                     # polarisation gains
+        elif u_rank > 0:
+            self.u_c = _ComplexVec(self.k, u_rank)   # (K,r) per-scatterer coeffs
+            self.u_b = _ComplexVec(u_rank, m)         # (r,M) shared angular basis
+        else:
+            self.u = _ComplexVec(self.k, m)
 
         # optional low-rank UE-dependent visibility gate (grafts NeRF2's
         # occlusion modelling: vis(x,k) = sigmoid(f(x) . g_k) in [0,1])
         if n_vis_rank > 0:
             self.enc_vis = FourierFeatures(3, n_freqs=6, include_input=True)
+            # feed the ray-traced map-context features alongside the position
+            # encoding so the gate learns geometry-driven occlusion, not just a
+            # smooth function of (x,y,z) -> should generalise to unseen positions.
             self.vis_mlp = nn.Sequential(
-                nn.Linear(self.enc_vis.out_dim, 128), nn.ReLU(inplace=True),
+                nn.Linear(self.enc_vis.out_dim + self.map_dim, 128),
+                nn.ReLU(inplace=True),
                 nn.Linear(128, n_vis_rank))
             self.vis_g = nn.Parameter(torch.randn(self.k, n_vis_rank) * 0.1)
             self.coord_scale = float(max(np.abs(spec.bs_position)) * 4 + 200)
+
+        # optional multi-head cross-attention visibility gate: the UE position is
+        # the QUERY, each scatterer's GEOMETRY (position) is a KEY.  The learned
+        # embedding makes "which scatterers this position sees" a smooth function
+        # of geometry -> generalises to unseen positions better than a free
+        # low-rank gate.  Sigmoid (not softmax) so many paths can stay active
+        # (superposition), and per-scatterer bias + per-head weight combine heads.
+        if n_attn_heads > 0:
+            self.enc_q = FourierFeatures(3, n_freqs=6, include_input=True)
+            self.enc_k = FourierFeatures(3, n_freqs=6, include_input=True)
+            h_out = n_attn_heads * attn_dim
+            self.q_proj = nn.Sequential(
+                nn.Linear(self.enc_q.out_dim, 128), nn.ReLU(inplace=True),
+                nn.Dropout(0.1), nn.Linear(128, h_out))
+            self.k_proj = nn.Sequential(
+                nn.Linear(self.enc_k.out_dim, 128), nn.ReLU(inplace=True),
+                nn.Linear(128, h_out))
+            self.head_w = nn.Parameter(torch.ones(n_attn_heads))
+            self.attn_bias = nn.Parameter(torch.zeros(self.k))
+            self._ascale = self._cscale
 
         # optional learned per-scatterer frequency envelope (low-rank, shared)
         if n_freq_basis > 0:
             self.wc = _ComplexVec(self.k, n_freq_basis)   # coeffs (K, R)
             self.wb = _ComplexVec(n_freq_basis, s)        # basis  (R, S)
+
+        # optional INDEPENDENT magnitude head: predicts |H| in NORMALISED dB.
+        # A position MLP drives a CP-factorised per-element field; a sigmoid
+        # keeps it in [0,1] which is de-normalised to [db_lo, db_hi] dB then to
+        # linear.  The scatter branch supplies the phase; this head the gain.
+        if n_mag_paths > 0:
+            self.mag_enc = FourierFeatures(3, n_freqs=mag_freqs, include_input=True)
+            self.mag_mlp = nn.Sequential(
+                nn.Linear(self.mag_enc.out_dim, 256), nn.ReLU(inplace=True),
+                nn.Linear(256, n_mag_paths))
+            sc = 1.0 / (n_mag_paths ** 0.5)
+            self.mag_u = nn.Parameter(torch.randn(n_mag_paths, m) * sc)
+            self.mag_v = nn.Parameter(torch.randn(n_mag_paths, n) * sc)
+            self.mag_w = nn.Parameter(torch.randn(n_mag_paths, s) * sc)
+            self.register_buffer("db_lo", torch.tensor(-80.0))
+            self.register_buffer("db_hi", torch.tensor(20.0))
+
+    def set_db_range(self, lo: float, hi: float) -> None:
+        self.db_lo.fill_(float(lo)); self.db_hi.fill_(float(hi))
 
     def set_scatterers(self, pts: np.ndarray) -> None:
         """Assign scatterer positions and recompute the BS distances (buffers)."""
@@ -112,20 +189,39 @@ class ScatterFieldModel(ChannelModel):
             self.scatterers - self.bs, dim=1).clamp_min(1e-3))
 
     def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        # positions: (B, 3) raw metres
+        # positions: (B, 3) raw metres, optionally followed by map-context feats
         b = positions.shape[0]
-        # geometry
-        d_ue = torch.cdist(positions, self.scatterers).clamp_min(1e-3)  # (B,K)
-        tau = d_ue + self.d_bs[None, :]                                 # (B,K)
-        amp = torch.exp(self.log_gain) / (d_ue * self.d_bs[None, :]) ** self.amp_power
+        mapfeat = positions[:, 3:3 + self.map_dim] if self.map_dim > 0 else None
+        positions = positions[:, :3]                                   # xyz only
+        # geometry (scatterer positions optionally gradient-refined)
+        scat = self.scatterers + self.scat_offset if self.learn_scatterers \
+            else self.scatterers
+        d_bs = (torch.linalg.norm(scat - self.bs, dim=1).clamp_min(1e-3)
+                if self.learn_scatterers else self.d_bs)
+        d_ue = torch.cdist(positions, scat).clamp_min(1e-3)            # (B,K)
+        tau = d_ue + d_bs[None, :]                                     # (B,K)
+        amp = torch.exp(self.log_gain) / (d_ue * d_bs[None, :]) ** self.amp_power
 
         a = self.a()                                                   # (K,)
         g = amp.to(a.dtype) * a[None, :]                               # (B,K) complex
         # grafted visibility gate (UE-dependent occlusion, low-rank)
         if self.n_vis_rank > 0:
-            f = self.vis_mlp(self.enc_vis(positions / self.coord_scale))  # (B,R)
+            enc = self.enc_vis(positions / self.coord_scale)
+            if mapfeat is not None:                    # append map-context feats
+                enc = torch.cat([enc, mapfeat], dim=1)
+            f = self.vis_mlp(enc)                                      # (B,R)
             vis = torch.sigmoid(f @ self.vis_g.t())                    # (B,K) in [0,1]
             g = g * vis.to(g.dtype)
+        # multi-head cross-attention gate: position (query) attends to scatterer
+        # geometry (keys) -> per-scatterer visibility in [0,1]
+        if self.n_attn_heads > 0:
+            q = self.q_proj(self.enc_q(positions / self._ascale)).reshape(
+                b, self.n_attn_heads, self.attn_dim)
+            k = self.k_proj(self.enc_k(scat / self._ascale)).reshape(
+                self.k, self.n_attn_heads, self.attn_dim)
+            sc = torch.einsum("bhd,khd->bhk", q, k) / (self.attn_dim ** 0.5)
+            logit = torch.einsum("bhk,h->bk", sc, self.head_w) + self.attn_bias
+            g = g * torch.sigmoid(logit).to(g.dtype)
         # scatterer dropout: randomly silence a fraction each step (regulariser)
         if self.training and self.scatter_dropout > 0:
             keep = 1.0 - self.scatter_dropout
@@ -140,7 +236,34 @@ class ScatterFieldModel(ChannelModel):
             w = self.wc() @ self.wb()                                  # (K,S)
             gd = gd * w[None, :, :]
 
-        uv = self.u()[:, :, None] * self.v()[:, None, :]               # (K,M,N)
+        uv = self._bs_signature(scat)[:, :, None] * self.v()[:, None, :]  # (K,M,N)
         # H(b,m,n,s) = sum_k uv(k,m,n) * gd(b,k,s)  -- no (B,K,M,N,S) intermediate
         h = torch.einsum("kmn,bks->bmns", uv, gd)
+
+        # independent magnitude head: replace |H| with a normalised-dB prediction
+        # while keeping the scatter branch's phase.
+        if self.n_mag_paths > 0:
+            f = self.mag_mlp(self.mag_enc(positions / self._cscale))        # (B,Km)
+            raw = torch.einsum("bk,km,kn,ks->bmns", f, self.mag_u,
+                               self.mag_v, self.mag_w)
+            db = self.db_lo + torch.sigmoid(raw) * (self.db_hi - self.db_lo)
+            mag = torch.pow(10.0, db / 20.0)
+            phase = h / h.abs().clamp_min(1e-20)
+            h = mag.to(h.dtype) * phase
         return h
+
+    def _bs_signature(self, scat: torch.Tensor) -> torch.Tensor:
+        """BS array signature U_k: free-learned, or geometric steering toward p_k."""
+        if not self.structured_u:
+            if self.u_rank > 0:
+                return self.u_c() @ self.u_b()          # (K,r)@(r,M) -> (K,M)
+            return self.u()
+        rel = scat - self.bs                                   # (K,3)
+        rn = torch.linalg.norm(rel, dim=1).clamp_min(1e-3)
+        ud, vd = rel[:, 1] / rn, rel[:, 2] / rn                # dir cosines (y-z UPA)
+        kbs = torch.exp(self.log_kappa_bs)
+        ph = kbs * (self.mh_idx[None, :, None] * ud[:, None, None]
+                    + self.mv_idx[None, None, :] * vd[:, None, None])   # (K,MH,MV)
+        steer = torch.complex(torch.cos(ph), torch.sin(ph))
+        pol = self.pol()                                       # (MP,)
+        return (steer[:, :, :, None] * pol[None, None, None, :]).reshape(self.k, self.spec.m)

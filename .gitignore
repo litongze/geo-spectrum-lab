@@ -34,3 +34,14 @@ output/
 Thumbs.db
 .idea/
 .vscode/
+
+# Large artifacts — never commit
+checkpoints/
+*.pt
+*.npy
+!docs/val_positions_200.npy
+!docs/val_indices_200.npy
+*.zip
+reference/
+best_submit/**/*.npy
+submission_round1/*.npy

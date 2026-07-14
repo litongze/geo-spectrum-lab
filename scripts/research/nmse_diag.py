@@ -1,0 +1,57 @@
+"""判决检验: C3=全局能量比 vs 逐样本平均NMSE, 哪个解释5个线上点(尤其GS4变差)"""
+import sys, os, json
+sys.path.insert(0, '/home/ltz/Huawei-wireless-competition')
+sys.path.insert(0, '/home/ltz/Huawei-wireless-competition/scripts')
+os.chdir('/home/ltz/Huawei-wireless-competition')
+import numpy as np, torch
+import torch.nn.functional as F
+dd="Round1_Map(2)/";st=json.load(open(dd+"Round1_Setup.json"))
+MH,MV,MP,N,S=st["M_H"],st["M_V"],st["M_P"],st["N"],st["S"];w=st["w"];dev="cuda"
+SC="."
+C_=torch.load(SC+"/explore_cache.pt")
+ap,ad=C_["ap"].to(dev),C_["ad"].to(dev)
+kp,kd=C_["kp"].to(dev),C_["kd"].to(dev)
+Href,gpas,gpdp,G=C_["Href"].to(dev),C_["gpas"].to(dev),C_["gpdp"].to(dev),C_["G"].to(dev)
+def PASt(x):
+    a=x.reshape(-1,MH,MV,MP,N,S);return torch.fft.fft2(a,dim=(1,2),norm="ortho").abs().square().sum(3).reshape(-1,MH*MV,N,S)
+def PDPt(x):return torch.fft.ifft(x,dim=-1,norm="ortho").abs().square()
+def nrm(P,dim):return P/P.norm(dim=dim,keepdim=True).clamp_min(1e-30)
+def comps(P,eps):
+    p1,p2=PASt(P),PDPt(P)
+    c1=float(F.cosine_similarity(p1,gpas,1,eps=eps).mean());c2=float(F.cosine_similarity(p2,gpdp,-1,eps=eps).mean())
+    nm_g=float((P-G).abs().square().sum()/G.abs().square().sum())
+    per=((P-G).abs().square().reshape(len(P),-1).sum(1)/G.abs().square().reshape(len(P),-1).sum(1).clamp_min(1e-38))
+    nm_ps=float(per.mean())                      # 逐样本NMSE再平均
+    c3_ps2=float((0.2/(1+per)).mean())/0.2       # 逐样本C3再平均(另一种)
+    return c1,c2,nm_g,nm_ps,c3_ps2
+a=0.7
+paT=nrm(a*ap+(1-a)*kp,1);pdT=nrm(a*ad+(1-a)*kd,-1)
+H0=Href.clone()
+for _ in range(5):
+    A=torch.fft.fft2(H0.reshape(-1,MH,MV,MP,N,S),dim=(1,2),norm="ortho")
+    cur=A.abs().square().sum(3).reshape(-1,MH*MV,N,S);sn=cur.norm(dim=1,keepdim=True).clamp_min(1e-30)
+    g=torch.sqrt((paT*sn).clamp_min(0)/cur.clamp_min(1e-38)).reshape(-1,MH,MV,1,N,S)
+    H0=torch.fft.ifft2(A*g,dim=(1,2),norm="ortho").reshape(H0.shape)
+    D=torch.fft.ifft(H0,dim=-1,norm="ortho");cur=D.abs().square();sn=cur.norm(dim=-1,keepdim=True).clamp_min(1e-30)
+    H0=torch.fft.fft(torch.sqrt((pdT*sn).clamp_min(0))*(D/D.abs().clamp_min(1e-30)),dim=-1,norm="ortho")
+def floor_(H,sc,ef=3e-9):
+    Hs=H/H.abs().pow(2).mean().sqrt()*sc
+    A=torch.fft.fft2(Hs.reshape(-1,MH,MV,MP,N,S),dim=(1,2),norm="ortho")
+    n_=A.abs().square().sum(3).reshape(-1,MH*MV,N,S).norm(dim=1,keepdim=True)
+    g=torch.sqrt((ef*1.02/n_.clamp_min(1e-38)).clamp_min(1.0)).reshape(-1,1,1,1,N,S)
+    Hs=torch.fft.ifft2(A*g,dim=(1,2),norm="ortho").reshape(Hs.shape)
+    D=torch.fft.ifft(Hs,dim=-1,norm="ortho");n2=D.abs().square().norm(dim=-1,keepdim=True)
+    return torch.fft.fft(D*torch.sqrt((ef*1.02/n2.clamp_min(1e-38)).clamp_min(1.0)),dim=-1,norm="ortho")
+print("配置        C1     C2     全局NMSE  逐样本NMSE  逐样本C3因子")
+for tag,sc in [("GS3(1.8e-5)",1.8e-5),("GS4(6e-6)",6e-6)]:
+    Hf=floor_(H0,sc)
+    for eps in [1e-9]:
+        c1,c2,ng,nps,c3p=comps(Hf,eps)
+        # 三种C总分
+        Cg=(w[0]*c1+w[1]*c2+w[2]/(1+ng))/sum(w)
+        Cp=(w[0]*c1+w[1]*c2+w[2]/(1+nps))/sum(w)
+        Cp2=(w[0]*c1+w[1]*c2+w[2]*c3p)/sum(w)
+        print("%s C1=%.4f C2=%.4f | NMSEg=%.3f->C=%.4f | NMSEps=%.3f->C=%.4f | C3ps2->C=%.4f"%(
+            tag,c1,c2,ng,Cg,nps,Cp,Cp2),flush=True)
+print("线上: GS3=0.42868 GS4=0.427022 (Δ=-0.0017)",flush=True)
+print("NMSEDIAG_DONE",flush=True)

@@ -40,25 +40,49 @@ class ChannelLoss(nn.Module):
     def __init__(self, spec: ChannelSpec,
                  lambda_pas: float = 1.0,
                  lambda_pdp: float = 1.0,
-                 lambda_mag: float = 1.0) -> None:
+                 lambda_mag: float = 1.0,
+                 lambda_magabs: float = 0.0,
+                 lambda_magdb: float = 0.0,
+                 db_floor: float = 1e-9) -> None:
         super().__init__()
         self.spec = spec
         self.lambda_pas = lambda_pas
         self.lambda_pdp = lambda_pdp
         self.lambda_mag = lambda_mag
+        self.lambda_magabs = lambda_magabs
+        self.lambda_magdb = lambda_magdb
+        self.db_floor = db_floor
 
     def forward(self, pred_h: torch.Tensor, gt_h: torch.Tensor) -> dict:
         """``pred_h`` / ``gt_h`` are complex ``(B, M, N, S)`` tensors."""
         loss_nmse = nmse(pred_h, gt_h)
-        # element-wise MSE — a magnitude signal that does not vanish with scale
+        # complex MSE: phase-sensitive -> collapses to 0 when phase can't match
         loss_mag = ((pred_h - gt_h).abs() ** 2).mean()
+        # phase-FREE magnitude MSE: pulls |pred| to the true scale without
+        # fighting the phase wall -> lets the model output the label scale.
+        loss_magabs = ((pred_h.abs() - gt_h.abs()) ** 2).mean()
+        # dB (log) magnitude MSE: matches the huge-dynamic-range gain in log
+        # space so small values are learned too (link-budget in dB).
+        lp = torch.log10(pred_h.abs().clamp_min(self.db_floor))
+        lg = torch.log10(gt_h.abs().clamp_min(self.db_floor))
+        loss_magdb = ((20.0 * (lp - lg)) ** 2).mean()
 
+        # Normalise pred to unit RMS before the PAS/PDP terms.  The two losses
+        # are scale-invariant, so magnitude is a *free direction* the optimiser
+        # can drift to ~1e-14 -> |FFT|^2 underflows in float32 and the cosine
+        # becomes a spurious ~0.98 artefact (a collapse trap that attention
+        # gates fall into).  Pinning pred to O(1) here removes the free
+        # direction and keeps the spectra numerically healthy.
+        rms = pred_h.abs().pow(2).mean().clamp_min(1e-30).sqrt()
+        pred_n = pred_h / rms
         c1 = cosine_similarity_along_last(
-            pas_spectrum(pred_h, self.spec), pas_spectrum(gt_h, self.spec))
+            pas_spectrum(pred_n, self.spec), pas_spectrum(gt_h, self.spec))
         c2 = cosine_similarity_along_last(
-            pdp_spectrum(pred_h, self.spec), pdp_spectrum(gt_h, self.spec))
+            pdp_spectrum(pred_n, self.spec), pdp_spectrum(gt_h, self.spec))
 
         total = (self.lambda_mag * loss_mag
+                 + self.lambda_magabs * loss_magabs
+                 + self.lambda_magdb * loss_magdb
                  + self.lambda_pas * (1.0 - c1)
                  + self.lambda_pdp * (1.0 - c2))
         return {

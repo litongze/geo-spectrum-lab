@@ -55,7 +55,7 @@ def main() -> None:
         raise SystemExit(
             f"model '{model_name}' not available. Have: {available_models()}")
     # physics models consume raw coordinates (they compute their own geometry)
-    standardize = model_name not in ("scatter_field", "nerf2")
+    standardize = model_name not in ("scatter_field", "nerf2", "nerf2ch")
 
     set_seed(int(train_cfg.get("seed", 0)))
 
@@ -73,10 +73,28 @@ def main() -> None:
     # scatter_field needs its scatterer cloud loaded into the model buffers
     if model_name == "scatter_field":
         pts = load_point_cloud(Path(datadir) / f"{rd.round_tag}_Map.ply")
+        n_all = len(pts)
+        if bool(data_cfg.get("scatter_importance", False)):
+            # importance sampling: keep only cloud points in the UE/BS region
+            tp = rd.train.positions
+            bs = np.asarray(rd.spec.bs_position, dtype=np.float32)
+            lo = np.minimum(tp.min(0), bs) - 30.0
+            hi = np.maximum(tp.max(0), bs) + 30.0
+            m = np.all((pts >= lo) & (pts <= hi), axis=1)
+            if m.sum() >= model.k:
+                pts = pts[m]
         rng = np.random.default_rng(int(train_cfg.get("seed", 0)))
         idx = rng.choice(len(pts), size=model.k, replace=len(pts) < model.k)
         model.set_scatterers(pts[idx])
-        print(f"[train] scatter_field: {model.k} scatterers from {len(pts)} pts")
+        print(f"[train] scatter_field: {model.k} scatterers from {len(pts)}/{n_all} pts")
+        # independent magnitude head: calibrate the normalised-dB range from data
+        if getattr(model, "n_mag_paths", 0) > 0:
+            ch = np.load(Path(datadir) / f"{rd.round_tag}_Train_Channel.npy")
+            mag = np.abs(ch) / rd.scaler.scale                # normalised |H|
+            db = 20.0 * np.log10(mag[mag > 0])
+            lo, hi = float(np.percentile(db, 0.1)), float(np.percentile(db, 99.9))
+            model.set_db_range(lo, hi)
+            print(f"[train] mag head normalised-dB range: [{lo:.1f}, {hi:.1f}]")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] model '{model_name}' with {n_params/1e6:.2f}M parameters")
 
