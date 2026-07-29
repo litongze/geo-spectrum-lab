@@ -13,12 +13,36 @@ import torch.nn.functional as F
 from scipy.spatial import cKDTree
 
 from _bootstrap import ROOT  # noqa: F401
+from complex_neighbor_gate import (
+    FEATURE_NAMES as COMPLEX_GATE_FEATURE_NAMES,
+)
+from complex_neighbor_gate import (
+    ComplexNeighborGate,
+    baseline_coefficients,
+    build_complex_features,
+)
+from neighbor_source_weights import (
+    anisotropic_weights,
+    equalize_amplitude,
+    moment_correct_weights,
+)
+from pas_transport_gate import (
+    FEATURE_NAMES as PAS_TRANSPORT_FEATURE_NAMES,
+    PasTransportGate,
+    build_gate_features,
+)
+from probe_array_steering_phase import array_coordinates
 from sweep_moment_attention import SliceAttention, moment_project, stable_unit
 from validate_moment_projection import enforce_pas, enforce_pdp
+from validate_moment_projection import enforce_pas_layout
 from wireless_twin.data.map_loader import load_point_cloud
 from wireless_twin.data.setup_config import load_setup
 from wireless_twin.models.raytrace2 import build_heightmap
-from wireless_twin.signal import pas_spectrum_phv, pdp_spectrum
+from wireless_twin.signal import (
+    pas_spectrum,
+    pas_spectrum_phv,
+    pdp_spectrum,
+)
 
 
 def sha256(path: Path) -> str:
@@ -47,9 +71,7 @@ def main() -> None:
     parser.add_argument(
         "--projection-result",
     )
-    parser.add_argument(
-        "--outdir", default="best_submit/BLEND_GS37_GEOPHASE_MOMENT"
-    )
+    parser.add_argument("--outdir")
     parser.add_argument("--pas-correction", type=float)
     parser.add_argument("--pas-radial", type=float)
     parser.add_argument("--pas-tangent", type=float)
@@ -66,6 +88,9 @@ def main() -> None:
 
     config_path = Path(args.config)
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    candidate_name = str(
+        config.get("name", "BLEND_GS37_GEOPHASE_MOMENT")
+    )
     seeds = [
         *[int(seed) for seed in config["tune_seeds"]],
         int(config["audit_seed"]),
@@ -130,12 +155,12 @@ def main() -> None:
         Path(args.projection_result) if args.projection_result else None
     )
     selected_projection = {
-        **config["projection"],
         "tune_median": None,
         "audit": None,
+        **config["projection"],
     }
     selection_policy = (
-        "parameters frozen in configs/gs37_geophase_moment.json"
+        f"parameters frozen in {config_path}"
     )
     if projection_path is not None:
         projection_payload = json.loads(
@@ -143,10 +168,18 @@ def main() -> None:
         )
         selected_projection = projection_payload["ranked"][0]
         selection_policy = projection_payload["selection_policy"]
-    if selected_projection["order"] != "pas_pdp":
+    projection_order = str(selected_projection["order"])
+    if projection_order not in {
+        "pas_pdp",
+        "pdp_pas",
+        "hvp_phv_pdp",
+        "phv_hvp_pdp",
+        "hvp_pdp_phv",
+        "phv_pdp_hvp",
+    }:
         raise ValueError(
-            "selected validation projection is not PAS->PDP: "
-            f"{selected_projection['order']}"
+            "unsupported selected validation projection: "
+            f"{projection_order}"
         )
     if int(selected_projection["iterations"]) != args.iterations:
         raise ValueError(
@@ -154,32 +187,412 @@ def main() -> None:
             f"{selected_projection['iterations']} != {args.iterations}"
         )
     output_scale = float(selected_projection["scale"])
+    residual_global_phase = float(
+        selected_projection.get(
+            "residual_global_phase",
+            config["projection"].get("residual_global_phase", 0.0),
+        )
+    )
 
     pool_idx = np.arange(len(train_pos), dtype=np.int64)
-    _, nearest_local = cKDTree(train_pos[:, :2]).query(
-        test_pos[:, :2], k=1
+    source_config = config.get(
+        "source",
+        {
+            "kind": "nearest",
+            "k": 1,
+            "radial_ratio": 1.0,
+            "distance_power": 0.0,
+            "amplitude": "raw",
+        },
     )
-    nearest_idx = pool_idx[np.asarray(nearest_local)]
-    source = torch.as_tensor(
-        np.array(train_channels[nearest_idx], copy=True),
-        dtype=torch.complex64,
-        device=device,
+    source_k = int(source_config.get("k", 1))
+    complex_gate_config = config.get("complex_gate")
+    complex_gate_components = []
+    if complex_gate_config is not None:
+        if source_k <= 1:
+            raise ValueError(
+                "complex-neighbor gate requires a multi-neighbor source"
+            )
+        if source_config.get("moment") is not None:
+            raise ValueError(
+                "complex-neighbor gate must be retrained for a "
+                "moment-corrected source"
+            )
+        component_specs = [
+            (
+                "primary",
+                complex_gate_config["checkpoint"],
+                complex_gate_config["alpha"],
+            )
+        ]
+        if complex_gate_config.get("secondary_checkpoint"):
+            component_specs.append(
+                (
+                    "secondary",
+                    complex_gate_config["secondary_checkpoint"],
+                    complex_gate_config["secondary_alpha"],
+                )
+            )
+        for role, checkpoint_name, alpha_value in component_specs:
+            alpha = float(alpha_value)
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError(
+                    f"{role} complex-neighbor gate alpha must "
+                    "be in [0, 1]"
+                )
+            if alpha == 0.0:
+                continue
+            checkpoint_path = Path(checkpoint_name)
+            payload = torch.load(
+                checkpoint_path,
+                map_location=device,
+                weights_only=False,
+            )
+            checkpoint_k = int(
+                payload.get("metadata", {}).get("k", source_k)
+            )
+            if checkpoint_k != source_k:
+                raise ValueError(
+                    f"{role} complex-neighbor gate K mismatch: "
+                    f"{checkpoint_k} != {source_k}"
+                )
+            feature_names = tuple(payload["feature_names"])
+            unknown_features = set(feature_names).difference(
+                COMPLEX_GATE_FEATURE_NAMES
+            )
+            if unknown_features:
+                raise ValueError(
+                    f"unknown {role} complex-neighbor gate "
+                    f"features: {sorted(unknown_features)}"
+                )
+            model = ComplexNeighborGate(
+                len(feature_names),
+                payload.get("architecture", "mlp16"),
+            ).to(device)
+            model.load_state_dict(payload["model_state"])
+            model.eval()
+            complex_gate_components.append(
+                {
+                    "role": role,
+                    "path": checkpoint_path,
+                    "alpha": alpha,
+                    "indices": [
+                        COMPLEX_GATE_FEATURE_NAMES.index(name)
+                        for name in feature_names
+                    ],
+                    "model": model,
+                    "mean": torch.as_tensor(
+                        payload["feature_mean"],
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    "std": torch.as_tensor(
+                        payload["feature_std"],
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                }
+            )
+    pas_transport = config["pas"].get("transport")
+    transport_k = (
+        int(pas_transport["k"]) if pas_transport is not None else 0
     )
+    if transport_k > source_k:
+        raise ValueError(
+            "PAS transport requires at least as many source neighbors: "
+            f"{transport_k} > {source_k}"
+        )
+    source_distance, local = cKDTree(train_pos[:, :2]).query(
+        test_pos[:, :2], k=source_k
+    )
+    source_distance = np.asarray(
+        source_distance, dtype=np.float64
+    ).reshape(
+        len(test_pos), source_k
+    )
+    neighbor_idx = pool_idx[np.asarray(local)].reshape(
+        len(test_pos), source_k
+    )
+    nearest_idx = neighbor_idx[:, 0]
     bs = np.asarray(spec.bs_position, dtype=np.float64)
     train_radius = np.linalg.norm(train_pos - bs[None], axis=1)
     test_radius = np.linalg.norm(test_pos - bs[None], axis=1)
-    delta_radius = test_radius - train_radius[nearest_idx]
+    train_unit = (train_pos - bs[None]) / np.maximum(
+        train_radius[:, None], 1e-12
+    )
+    test_unit = (test_pos - bs[None]) / np.maximum(
+        test_radius[:, None], 1e-12
+    )
+    delta_radius = (
+        test_radius[:, None] - train_radius[neighbor_idx]
+    )
+    delta_unit = test_unit[:, None] - train_unit[neighbor_idx]
+    delta_xy = (
+        train_pos[neighbor_idx, :2] - test_pos[:, None, :2]
+    )
+    radial = test_pos[:, :2] - bs[None, :2]
+    radial /= np.maximum(
+        np.linalg.norm(radial, axis=1, keepdims=True), 1e-12
+    )
+    tangent = np.column_stack([-radial[:, 1], radial[:, 0]])
+    radial_delta = np.einsum("bkd,bd->bk", delta_xy, radial)
+    tangent_delta = np.einsum("bkd,bd->bk", delta_xy, tangent)
     subcarrier = np.arange(spec.s, dtype=np.float64)
     subcarrier -= subcarrier.mean()
-    phase = (
-        (k0 + k1 * subcarrier[None]) * delta_radius[:, None]
-        + global_phase
+    steering_config = config.get("steering")
+    steering_horizontal = None
+    steering_vertical = None
+    steering_axis = None
+    if steering_config is not None:
+        steering_horizontal, steering_vertical = array_coordinates(
+            spec, str(steering_config["layout"])
+        )
+        steering_axis = np.asarray(
+            [
+                np.cos(float(steering_config["theta"])),
+                np.sin(float(steering_config["theta"])),
+            ],
+            dtype=np.float64,
+        )
+    source = torch.zeros_like(baseline)
+    transported_pas = (
+        torch.zeros(
+            (
+                len(test_pos),
+                spec.n,
+                spec.s,
+                spec.mh * spec.mv,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        if pas_transport is not None
+        else None
     )
-    source *= torch.as_tensor(
-        np.exp(1j * phase),
-        dtype=torch.complex64,
-        device=device,
-    )[:, None, None, :]
+    inline_global_phase = (
+        source_k == 1
+        and source_config.get("kind", "nearest") == "nearest"
+    )
+    for start in range(0, len(test_pos), args.batch_size):
+        stop = min(start + args.batch_size, len(test_pos))
+        batch = stop - start
+        neighbors = torch.as_tensor(
+            np.array(
+                train_channels[neighbor_idx[start:stop].reshape(-1)],
+                copy=True,
+            ).reshape(
+                batch,
+                source_k,
+                spec.m,
+                spec.n,
+                spec.s,
+            ),
+            dtype=torch.complex64,
+            device=device,
+        )
+        phase = (
+            (
+                k0 + k1 * subcarrier[None, None]
+            )
+            * delta_radius[start:stop, :, None]
+        )
+        if inline_global_phase:
+            phase = phase + global_phase
+        neighbors *= torch.as_tensor(
+            np.exp(1j * phase),
+            dtype=torch.complex64,
+            device=device,
+        )[:, :, None, None, :]
+        if steering_config is not None:
+            delta_horizontal = np.einsum(
+                "bkd,d->bk",
+                delta_unit[start:stop, :, :2],
+                steering_axis,
+            )
+            steering_phase = (
+                float(steering_config["horizontal_coefficient"])
+                * delta_horizontal[:, :, None]
+                * steering_horizontal[None, None, :]
+                + float(steering_config["vertical_coefficient"])
+                * delta_unit[start:stop, :, 2:3]
+                * steering_vertical[None, None, :]
+            )
+            neighbors *= torch.as_tensor(
+                np.exp(1j * steering_phase),
+                dtype=torch.complex64,
+                device=device,
+            )[:, :, :, None, None]
+        if transported_pas is not None:
+            neighbor_pas = stable_unit(
+                pas_spectrum_phv(
+                    neighbors[:, :transport_k].reshape(
+                        batch * transport_k,
+                        spec.m,
+                        spec.n,
+                        spec.s,
+                    ),
+                    spec,
+                )
+            ).reshape(
+                batch,
+                transport_k,
+                spec.n,
+                spec.s,
+                spec.mh * spec.mv,
+            )
+            transport_weight = (
+                1.0
+                / np.maximum(
+                    source_distance[start:stop, :transport_k],
+                    0.05,
+                )
+                ** float(pas_transport["distance_power"])
+            )
+            transport_weight /= np.maximum(
+                transport_weight.sum(axis=1, keepdims=True),
+                1e-30,
+            )
+            transported_pas[start:stop] = stable_unit(
+                torch.einsum(
+                    "bk,bknsa->bnsa",
+                    torch.as_tensor(
+                        transport_weight,
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    neighbor_pas,
+                )
+            )
+        if source_k == 1:
+            weight = np.ones((batch, 1), dtype=np.float64)
+        else:
+            radial_ratio = float(
+                source_config["radial_ratio"]
+            )
+            distance_power = float(
+                source_config["distance_power"]
+            )
+            weight, effective = anisotropic_weights(
+                radial_delta[start:stop],
+                tangent_delta[start:stop],
+                radial_ratio,
+                distance_power,
+            )
+            moment_config = source_config.get("moment")
+            if moment_config is not None:
+                weight = moment_correct_weights(
+                    weight,
+                    radial_delta[start:stop],
+                    tangent_delta[start:stop],
+                    ridge=float(moment_config["ridge"]),
+                    strength=float(moment_config["strength"]),
+                )
+        if complex_gate_components:
+            source_flat = neighbors.reshape(batch, source_k, -1)
+            gram = torch.einsum(
+                "bil,bjl->bij",
+                source_flat.conj(),
+                source_flat,
+            )
+            base_weight_t = torch.as_tensor(
+                weight,
+                dtype=torch.float32,
+                device=device,
+            )
+            gate_features, gate_amplitude = build_complex_features(
+                gram,
+                base_weight_t,
+                torch.as_tensor(
+                    source_distance[start:stop],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    effective,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    radial_delta[start:stop],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    tangent_delta[start:stop],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    test_pos[start:stop],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    bs,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            baseline_weight = baseline_coefficients(
+                base_weight_t, gate_amplitude
+            )
+            weight_t = baseline_weight
+            with torch.inference_mode():
+                for component in complex_gate_components:
+                    normalized_features = (
+                        (
+                            gate_features[
+                                ..., component["indices"]
+                            ]
+                            - component["mean"]
+                        )
+                        / component["std"]
+                    ).clamp(-8.0, 8.0)
+                    learned_weight, _ = component[
+                        "model"
+                    ].coefficients(
+                        normalized_features,
+                        base_weight_t,
+                        gate_amplitude,
+                    )
+                    if component["role"] == "primary":
+                        weight_t = (
+                            (1.0 - component["alpha"])
+                            * baseline_weight
+                            + component["alpha"] * learned_weight
+                        )
+                    else:
+                        weight_t += component["alpha"] * (
+                            learned_weight - baseline_weight
+                        )
+        else:
+            if source_config.get("amplitude", "raw") == "equalized":
+                energy = (
+                    neighbors.abs()
+                    .square()
+                    .sum(dim=(2, 3, 4))
+                    .cpu()
+                    .numpy()
+                )
+                weight = equalize_amplitude(
+                    weight,
+                    np.sqrt(np.maximum(energy, 1e-30)),
+                )
+            weight_t = torch.as_tensor(
+                weight, dtype=torch.complex64, device=device
+            )
+        source[start:stop] = torch.einsum(
+            "bk,bkmns->bmns", weight_t, neighbors
+        )
+        del neighbors
+    if not inline_global_phase:
+        source *= torch.exp(
+            torch.tensor(
+                1j * global_phase,
+                dtype=torch.complex64,
+                device=device,
+            )
+        )
     source_rms_before_seed = source.abs().square().mean().sqrt()
     source = source + (
         args.phase_seed_epsilon
@@ -212,10 +625,15 @@ def main() -> None:
             "checkpoints/clean_panel/s{seed}/"
             "nbrattn_clean_k32_pdp_k32s0.pt"
         ),
+        "hvp": (
+            "checkpoints/clean_panel/s{seed}/"
+            "nbrattn_clean_k32_pas_k32s0.pt"
+        ),
     }
     cache_names = {
         "pas": "train_pas_phv.npy",
         "pdp": "train_pdp.npy",
+        "hvp": "train_pas_hvp.npy",
     }
     manifest = {
         "config": f"{config_path}:{sha256(config_path)}",
@@ -230,6 +648,13 @@ def main() -> None:
         manifest["projection_result"] = (
             f"{projection_path}:{sha256(projection_path)}"
         )
+    if complex_gate_components:
+        manifest["complex_neighbor_gates"] = {
+            component["role"]: (
+                f"{component['path']}:{sha256(component['path'])}"
+            )
+            for component in complex_gate_components
+        }
 
     def build_features(
         spectra: torch.Tensor,
@@ -376,8 +801,14 @@ def main() -> None:
             dim=-1,
         )
 
+    hvp_target_config = config["pas"].get("hvp")
+    post_bilateral_config = config["pdp"].get("post_bilateral")
+    post_bilateral_pdp = None
     experts = {}
-    for domain in ("pas", "pdp"):
+    expert_domains = ["pas", "pdp"]
+    if hvp_target_config is not None:
+        expert_domains.append("hvp")
+    for domain in expert_domains:
         print(f"[GS37] loading {domain} spectra", flush=True)
         cached = np.load(
             Path(args.cache_dir) / cache_names[domain], mmap_mode="r"
@@ -390,38 +821,102 @@ def main() -> None:
             )
         )
         del cached
-        k = 16 if domain == "pas" else 32
+        if domain == "pas":
+            domain_config = config["pas"]
+            k = 16
+            correction = args.pas_correction
+            radial_multiplier = args.pas_radial
+            tangent_multiplier = args.pas_tangent
+        elif domain == "pdp":
+            domain_config = config["pdp"]
+            k = 32
+            correction = args.pdp_correction
+            radial_multiplier = args.pdp_radial
+            tangent_multiplier = args.pdp_tangent
+        else:
+            domain_config = hvp_target_config
+            k = int(domain_config.get("k", 32))
+            correction = float(domain_config["correction"])
+            radial_multiplier = float(
+                domain_config["radial_multiplier"]
+            )
+            tangent_multiplier = float(
+                domain_config["tangent_multiplier"]
+            )
         distance, local = cKDTree(train_pos[:, :2]).query(
             test_pos[:, :2], k=k
         )
         distance = np.asarray(distance, dtype=np.float32)
         neighbors = pool_idx[np.asarray(local)]
+        if domain == "pdp" and post_bilateral_config is not None:
+            bilateral_k = int(post_bilateral_config.get("k", 32))
+            if bilateral_k > k:
+                raise ValueError(
+                    "post-bilateral PDP K exceeds PDP expert K: "
+                    f"{bilateral_k} > {k}"
+                )
+            distance_power = float(
+                post_bilateral_config["distance_power"]
+            )
+            anchor_strength = float(
+                post_bilateral_config["anchor_strength"]
+            )
+            bilateral_chunks = []
+            with torch.inference_mode():
+                for start in range(0, len(test_pos), args.batch_size):
+                    stop = min(start + args.batch_size, len(test_pos))
+                    neighbor_t = torch.as_tensor(
+                        neighbors[start:stop, :bilateral_k],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    values = spectra[neighbor_t]
+                    nearest_agreement = (
+                        values * values[:, :1]
+                    ).sum(dim=-1).mean(dim=(2, 3))
+                    distance_t = torch.as_tensor(
+                        distance[start:stop, :bilateral_k],
+                        dtype=torch.float32,
+                        device=device,
+                    ).clamp_min(0.3)
+                    weight = torch.softmax(
+                        -distance_power * distance_t.log()
+                        + anchor_strength * nearest_agreement,
+                        dim=1,
+                    )
+                    bilateral_chunks.append(
+                        stable_unit(
+                            torch.einsum(
+                                "bk,bkmns->bmns", weight, values
+                            )
+                        )
+                    )
+            post_bilateral_pdp = torch.cat(bilateral_chunks)
+            manifest["post_bilateral_pdp"] = {
+                **post_bilateral_config,
+                "selection": "source-only nearest-global agreement",
+            }
         expert_sum = torch.zeros(
             (len(test_pos),) + tuple(spectra.shape[1:]),
             dtype=torch.float32,
             device=device,
         )
-        correction = (
-            args.pas_correction
-            if domain == "pas"
-            else args.pdp_correction
-        )
         axis_multiplier = torch.tensor(
             [
-                args.pas_radial
-                if domain == "pas"
-                else args.pdp_radial,
-                args.pas_tangent
-                if domain == "pas"
-                else args.pdp_tangent,
+                radial_multiplier,
+                tangent_multiplier,
             ],
             dtype=torch.float32,
             device=device,
         )
         for seed in seeds:
-            checkpoint = Path(
-                checkpoint_templates[domain].format(seed=seed)
+            checkpoint_template = str(
+                domain_config.get(
+                    "checkpoint_template",
+                    checkpoint_templates[domain],
+                )
             )
+            checkpoint = Path(checkpoint_template.format(seed=seed))
             payload = torch.load(
                 checkpoint, map_location=device, weights_only=False
             )
@@ -478,6 +973,95 @@ def main() -> None:
         del spectra, expert_sum
         torch.cuda.empty_cache()
 
+    transport_gate_stats = None
+    if transported_pas is not None:
+        gate_checkpoint = pas_transport.get("gate_checkpoint")
+        if gate_checkpoint:
+            gate_path = Path(gate_checkpoint)
+            payload = torch.load(
+                gate_path, map_location=device, weights_only=False
+            )
+            if payload["feature_names"] != list(
+                PAS_TRANSPORT_FEATURE_NAMES
+            ):
+                raise ValueError(
+                    "PAS transport gate feature definition mismatch"
+                )
+            gate = PasTransportGate(
+                len(PAS_TRANSPORT_FEATURE_NAMES),
+                str(payload["architecture"]),
+            ).to(device)
+            gate.load_state_dict(payload["model_state"])
+            gate.eval()
+            feature_mean = torch.as_tensor(
+                payload["feature_mean"],
+                dtype=torch.float32,
+                device=device,
+            )
+            feature_std = torch.as_tensor(
+                payload["feature_std"],
+                dtype=torch.float32,
+                device=device,
+            )
+            beta_chunks = []
+            with torch.inference_mode():
+                for start in range(0, len(test_pos), args.batch_size):
+                    stop = min(
+                        start + args.batch_size, len(test_pos)
+                    )
+                    gate_features = build_gate_features(
+                        experts["pas"][start:stop],
+                        transported_pas[start:stop],
+                        torch.as_tensor(
+                            test_pos[start:stop],
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            source_distance[
+                                start:stop, :transport_k
+                            ],
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            bs, dtype=torch.float32, device=device
+                        ),
+                        spec.mh,
+                        spec.mv,
+                    )
+                    normalized = (
+                        gate_features - feature_mean
+                    ) / feature_std
+                    beta_chunks.append(
+                        gate(normalized.clamp(-8.0, 8.0))
+                    )
+            transport_beta = torch.cat(beta_chunks)
+            experts["pas"] = stable_unit(
+                (1.0 - transport_beta[..., None]) * experts["pas"]
+                + transport_beta[..., None] * transported_pas
+            )
+            transport_gate_stats = {
+                "checkpoint": f"{gate_path}:{sha256(gate_path)}",
+                "architecture": payload["architecture"],
+                "beta_mean": float(transport_beta.mean()),
+                "beta_std": float(
+                    transport_beta.std(correction=0)
+                ),
+                "beta_min": float(transport_beta.min()),
+                "beta_max": float(transport_beta.max()),
+            }
+            manifest["pas_transport_gate"] = (
+                transport_gate_stats["checkpoint"]
+            )
+            del gate, gate_features, normalized, beta_chunks
+        else:
+            transport_blend = float(pas_transport["blend"])
+            experts["pas"] = stable_unit(
+                (1.0 - transport_blend) * experts["pas"]
+                + transport_blend * transported_pas
+            )
+
     baseline_pas = stable_unit(pas_spectrum_phv(baseline, spec))
     baseline_pdp = stable_unit(pdp_spectrum(baseline, spec))
     target_pas = stable_unit(
@@ -488,11 +1072,103 @@ def main() -> None:
         (1.0 - args.pdp_blend) * baseline_pdp
         + args.pdp_blend * experts["pdp"]
     )
-    prediction = source
-    for _ in range(args.iterations):
-        prediction = enforce_pas(prediction, target_pas, spec)
-        prediction = enforce_pdp(prediction, target_pdp)
-    prediction *= output_scale
+    baseline_hvp = None
+    target_hvp = None
+    if hvp_target_config is not None:
+        baseline_hvp = stable_unit(pas_spectrum(baseline, spec))
+        hvp_blend = float(hvp_target_config["blend"])
+        target_hvp = stable_unit(
+            (1.0 - hvp_blend) * baseline_hvp
+            + hvp_blend * experts["hvp"]
+        )
+    projection_steps = {
+        "pas_pdp": ("phv", "pdp"),
+        "pdp_pas": ("pdp", "phv"),
+        "hvp_phv_pdp": ("hvp", "phv", "pdp"),
+        "phv_hvp_pdp": ("phv", "hvp", "pdp"),
+        "hvp_pdp_phv": ("hvp", "pdp", "phv"),
+        "phv_pdp_hvp": ("phv", "pdp", "hvp"),
+    }[projection_order]
+
+    def project_channel(
+        initial: torch.Tensor, steps: tuple[str, ...]
+    ) -> torch.Tensor:
+        current = initial.clone()
+        for _ in range(args.iterations):
+            for step in steps:
+                if step == "phv":
+                    current = enforce_pas(
+                        current, target_pas, spec
+                    )
+                elif step == "pdp":
+                    current = enforce_pdp(current, target_pdp)
+                else:
+                    if target_hvp is None:
+                        raise ValueError(
+                            "HVP projection requested without "
+                            "pas.hvp config"
+                        )
+                    current = enforce_pas_layout(
+                        current, target_hvp, spec, "hvp"
+                    )
+        return current
+
+    dual_mix = config["projection"].get("dual_mix")
+    if dual_mix is not None:
+        reference_prediction = project_channel(
+            source, ("phv", "pdp")
+        )
+        dual_prediction = project_channel(source, projection_steps)
+        dual_mix = float(dual_mix)
+        prediction = (
+            (1.0 - dual_mix) * reference_prediction
+            + dual_mix * dual_prediction
+        )
+        del reference_prediction, dual_prediction
+    else:
+        prediction = project_channel(source, projection_steps)
+    source_blend = config["projection"].get("source_blend")
+    if source_blend is not None:
+        source_blend = float(source_blend)
+        if not 0.0 <= source_blend <= 1.0:
+            raise ValueError("source_blend must be in [0, 1]")
+        prediction = (
+            (1.0 - source_blend) * source
+            + source_blend * prediction
+        )
+    if post_bilateral_config is not None:
+        if post_bilateral_pdp is None:
+            raise RuntimeError("post-bilateral PDP target was not built")
+        target_beta = float(post_bilateral_config["target_beta"])
+        channel_mix = float(
+            post_bilateral_config.get("channel_mix", 1.0)
+        )
+        if not 0.0 <= target_beta <= 1.0:
+            raise ValueError(
+                "post-bilateral PDP target_beta must be in [0, 1]"
+            )
+        if not 0.0 <= channel_mix <= 1.0:
+            raise ValueError(
+                "post-bilateral PDP channel_mix must be in [0, 1]"
+            )
+        current_pdp = stable_unit(pdp_spectrum(prediction, spec))
+        bilateral_target = stable_unit(
+            (1.0 - target_beta) * current_pdp
+            + target_beta * post_bilateral_pdp
+        )
+        bilateral_prediction = enforce_pdp(
+            prediction, bilateral_target
+        )
+        prediction = (
+            (1.0 - channel_mix) * prediction
+            + channel_mix * bilateral_prediction
+        )
+        del current_pdp, bilateral_target, bilateral_prediction
+    prediction *= torch.tensor(
+        output_scale * np.exp(1j * residual_global_phase),
+        dtype=torch.complex64,
+        device=device,
+    )
 
     output = prediction.detach().cpu().numpy().astype(np.complex64)
     if output.shape != baseline.shape:
@@ -502,7 +1178,11 @@ def main() -> None:
     ).all():
         raise ValueError("output contains non-finite values")
 
-    outdir = Path(args.outdir)
+    outdir = (
+        Path(args.outdir)
+        if args.outdir
+        else Path("best_submit") / candidate_name
+    )
     outdir.mkdir(parents=True, exist_ok=True)
     output_path = outdir / "Round1_Test_Channel.npy"
     np.save(output_path, output)
@@ -511,6 +1191,11 @@ def main() -> None:
     )
     final_pas = stable_unit(pas_spectrum_phv(prediction, spec))
     final_pdp = stable_unit(pdp_spectrum(prediction, spec))
+    final_hvp = (
+        stable_unit(pas_spectrum(prediction, spec))
+        if target_hvp is not None
+        else None
+    )
     pas_cosine = float((final_pas * baseline_pas).sum(dim=-1).mean())
     pdp_cosine = float((final_pdp * baseline_pdp).sum(dim=-1).mean())
     target_pas_cosine = float(
@@ -519,17 +1204,21 @@ def main() -> None:
     target_pdp_cosine = float(
         (final_pdp * target_pdp).sum(dim=-1).mean()
     )
+    target_hvp_cosine = (
+        float((final_hvp * target_hvp).sum(dim=-1).mean())
+        if final_hvp is not None
+        else None
+    )
     channel_cosine = float(
         (prediction.conj() * baseline).sum().abs()
         / (
             prediction.norm() * baseline.norm()
         ).clamp_min(1e-30)
     )
-    nearest_distance = np.linalg.norm(
-        test_pos[:, :2] - train_pos[nearest_idx, :2], axis=1
-    )
+    nearest_distance = source_distance[:, 0]
+    nearest_delta_radius = delta_radius[:, 0]
     result = {
-        "name": "BLEND_GS37_GEOPHASE_MOMENT",
+        "name": candidate_name,
         "validation": {
             "phase": str(phase_path) if phase_path else None,
             "projection": (
@@ -546,18 +1235,22 @@ def main() -> None:
         "geometric_phase": {
             "k0_rad_per_meter": k0,
             "k1_rad_per_meter_per_subcarrier": k1,
-            "global_phase": global_phase,
+            "initial_global_phase": global_phase,
+            "residual_global_phase": residual_global_phase,
             "phase_seed_epsilon": args.phase_seed_epsilon,
+            "source": source_config,
+            "complex_neighbor_gate": complex_gate_config,
+            "steering": steering_config,
             "nearest_xy_distance": {
                 "mean": float(nearest_distance.mean()),
                 "median": float(np.median(nearest_distance)),
                 "max": float(nearest_distance.max()),
             },
             "delta_bs_radius": {
-                "mean": float(delta_radius.mean()),
-                "std": float(delta_radius.std()),
-                "min": float(delta_radius.min()),
-                "max": float(delta_radius.max()),
+                "mean": float(nearest_delta_radius.mean()),
+                "std": float(nearest_delta_radius.std()),
+                "min": float(nearest_delta_radius.min()),
+                "max": float(nearest_delta_radius.max()),
             },
         },
         "pas": {
@@ -566,6 +1259,9 @@ def main() -> None:
             "radial_multiplier": args.pas_radial,
             "tangent_multiplier": args.pas_tangent,
             "blend": args.pas_blend,
+            "transport": pas_transport,
+            "transport_gate": transport_gate_stats,
+            "hvp": hvp_target_config,
         },
         "pdp": {
             "k": 32,
@@ -573,8 +1269,11 @@ def main() -> None:
             "radial_multiplier": args.pdp_radial,
             "tangent_multiplier": args.pdp_tangent,
             "blend": args.pdp_blend,
+            "post_bilateral": post_bilateral_config,
         },
-        "projection_order": "pas_pdp",
+        "projection_order": projection_order,
+        "dual_mix": dual_mix,
+        "source_blend": source_blend,
         "iterations": args.iterations,
         "source_rms": source_rms,
         "baseline_rms": baseline_rms,
@@ -588,6 +1287,7 @@ def main() -> None:
         "projection_fidelity": {
             "pas_cosine_to_target": target_pas_cosine,
             "pdp_cosine_to_target": target_pdp_cosine,
+            "hvp_cosine_to_target": target_hvp_cosine,
         },
         "shape": list(output.shape),
         "dtype": str(output.dtype),
@@ -599,33 +1299,103 @@ def main() -> None:
         encoding="utf-8",
     )
     (outdir / "说明.txt").write_text(
-        "BLEND_GS37_GEOPHASE_MOMENT\n\n"
-        "独立几何相位突破候选，不使用或反推队友模型。\n"
-        "相位源: 全训练库二维最近邻复信道，并按 UE 到基站的"
-        "三维距离差施加宽带相位斜坡。\n"
-        f"相位参数: k0={k0:.9f} rad/m, "
+        f"{candidate_name}\n\n"
+        "几何相位与矩约束频谱候选。\n"
+        f"相位源: K={source_k}, "
+        f"radial_ratio={source_config.get('radial_ratio', 1.0)}, "
+        f"power={source_config.get('distance_power', 0.0)}, "
+        f"amplitude={source_config.get('amplitude', 'raw')}。\n"
+        + (
+            "阵列转向: "
+            f"layout={steering_config['layout']}, "
+            f"theta={steering_config['theta']:.9f}, "
+            "horizontal="
+            f"{steering_config['horizontal_coefficient']:.9f}, "
+            "vertical="
+            f"{steering_config['vertical_coefficient']:.9f}。\n"
+            if steering_config is not None
+            else ""
+        )
+        + f"相位参数: k0={k0:.9f} rad/m, "
         f"k1={k1:.9f} rad/(m*subcarrier), "
-        f"global={global_phase:.9f} rad。\n"
+        f"initial_global={global_phase:.9f} rad, "
+        f"residual_global={residual_global_phase:.9f} rad。\n"
         "频谱目标: GS34 基线 + 五折矩约束注意力；"
-        "PAS 融合 0.8，PDP 融合 0.3。\n"
-        "重建: PAS->PDP 交替投影 8 轮；"
-        f"幅度尺度={output_scale:.9f}，来自四个 tune split，"
-        "audit split 未参与选参。\n\n"
-        "clean no-eps 完整复信道验证:\n"
-        "- tune median C: 0.74307 -> 0.75707 (+0.01400)\n"
-        "- audit C: 0.76796 -> 0.78438 (+0.01642)\n"
-        "- 五个 split 全部显著提升。\n\n"
-        "这是当前首选突破提交；GS30 仍是已验证线上保底。\n",
+        f"PAS 融合 {args.pas_blend:g}，"
+        f"PDP 融合 {args.pdp_blend:g}。\n"
+        + (
+            "PAS 物理搬移专家: "
+            f"K={transport_k}, "
+            f"distance_power={pas_transport['distance_power']}, "
+            + (
+                "expert_blend=逐切片低容量门控"
+                f"({transport_gate_stats['architecture']}, "
+                f"mean={transport_gate_stats['beta_mean']:.4f})。\n"
+                if transport_gate_stats is not None
+                else f"expert_blend={pas_transport['blend']}。\n"
+            )
+            if pas_transport is not None
+            else ""
+        )
+        + (
+            "HVP 稳健目标: "
+            f"K={hvp_target_config.get('k', 32)}, "
+            f"correction={hvp_target_config['correction']}, "
+            f"blend={hvp_target_config['blend']}。\n"
+            if hvp_target_config is not None
+            else ""
+        )
+        + (
+            "PDP 谱形一致性后投影: "
+            f"K={post_bilateral_config.get('k', 32)}, "
+            "distance_power="
+            f"{post_bilateral_config['distance_power']}, "
+            "anchor_strength="
+            f"{post_bilateral_config['anchor_strength']}, "
+            f"target_beta={post_bilateral_config['target_beta']}。\n"
+            if post_bilateral_config is not None
+            else ""
+        )
+        + f"重建: {projection_order} 交替投影 "
+        f"{args.iterations} 轮；"
+        + (
+            "复邻居低容量门控: "
+            + ", ".join(
+                f"{component['role']}="
+                f"{component['alpha']:g}"
+                for component in complex_gate_components
+            )
+            + "；"
+            if complex_gate_config is not None
+            else ""
+        )
+        + (
+            f"与 PHV-PDP 参考按 {dual_mix:g} 复通道混合；"
+            if dual_mix is not None
+            else ""
+        )
+        + (
+            f"投影结果按 {source_blend:g} 与源复通道混合；"
+            if source_blend is not None
+            else ""
+        )
+        + f"幅度尺度={output_scale:.9f}，来自四个 tune split，"
+        "audit split 未参与选参。\n",
         encoding="utf-8",
     )
     print(
-        f"GS37_GEOPHASE_DONE path={output_path} "
+        f"GEOPHASE_DONE name={candidate_name} path={output_path} "
         f"source_rms={source_rms:.9e} output_rms={output_rms:.9e} "
         f"pas_cos={pas_cosine:.6f} pdp_cos={pdp_cosine:.6f} "
         f"channel_cos={channel_cosine:.6f} "
         f"target_pas={target_pas_cosine:.6f} "
         f"target_pdp={target_pdp_cosine:.6f} "
-        f"sha256={result['sha256']}",
+        + (
+            f"target_hvp={target_hvp_cosine:.6f} "
+            if target_hvp_cosine is not None
+            else ""
+        )
+        + f"sha256={result['sha256']}",
         flush=True,
     )
 

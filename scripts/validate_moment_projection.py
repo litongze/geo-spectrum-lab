@@ -30,33 +30,92 @@ def stable_unit(value: torch.Tensor) -> torch.Tensor:
 def enforce_pas(
     channel: torch.Tensor, target: torch.Tensor, spec
 ) -> torch.Tensor:
+    return enforce_pas_layout(channel, target, spec, "phv")
+
+
+def enforce_pas_layout(
+    channel: torch.Tensor,
+    target: torch.Tensor,
+    spec,
+    layout: str,
+) -> torch.Tensor:
+    """Enforce a PAS target under one explicit BS-array flattening."""
     batch = channel.shape[0]
-    angular = torch.fft.fft2(
-        channel.reshape(
+    if layout == "phv":
+        shaped = channel.reshape(
             batch,
             spec.mp,
             spec.mh,
             spec.mv,
             spec.n,
             spec.s,
-        ),
-        dim=(2, 3),
-        norm="ortho",
+        )
+        fft_dims = (2, 3)
+        polarization_dim = 1
+        gain_shape = (
+            batch,
+            1,
+            spec.mh,
+            spec.mv,
+            spec.n,
+            spec.s,
+        )
+    elif layout == "hvp":
+        shaped = channel.reshape(
+            batch,
+            spec.mh,
+            spec.mv,
+            spec.mp,
+            spec.n,
+            spec.s,
+        )
+        fft_dims = (1, 2)
+        polarization_dim = 3
+        gain_shape = (
+            batch,
+            spec.mh,
+            spec.mv,
+            1,
+            spec.n,
+            spec.s,
+        )
+    elif layout == "pvh":
+        shaped = channel.reshape(
+            batch,
+            spec.mp,
+            spec.mv,
+            spec.mh,
+            spec.n,
+            spec.s,
+        )
+        fft_dims = (2, 3)
+        polarization_dim = 1
+        gain_shape = (
+            batch,
+            1,
+            spec.mv,
+            spec.mh,
+            spec.n,
+            spec.s,
+        )
+    else:
+        raise ValueError(f"unsupported PAS layout {layout}")
+
+    angular = torch.fft.fft2(
+        shaped, dim=fft_dims, norm="ortho"
     )
-    current = angular.abs().square().sum(dim=1).reshape(
-        batch, spec.mh * spec.mv, spec.n, spec.s
-    )
+    current = angular.abs().square().sum(
+        dim=polarization_dim
+    ).reshape(batch, spec.mh * spec.mv, spec.n, spec.s)
     target_first = target.permute(0, 3, 1, 2)
     desired = target_first * current.norm(
         dim=1, keepdim=True
     ).clamp_min(torch.finfo(torch.float32).tiny)
     gain = torch.sqrt(
         desired.clamp_min(0.0) / current.clamp_min(1e-38)
-    ).reshape(
-        batch, 1, spec.mh, spec.mv, spec.n, spec.s
-    )
+    ).reshape(gain_shape)
     return torch.fft.ifft2(
-        angular * gain, dim=(2, 3), norm="ortho"
+        angular * gain, dim=fft_dims, norm="ortho"
     ).reshape(batch, spec.m, spec.n, spec.s)
 
 

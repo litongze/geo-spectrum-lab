@@ -17,7 +17,12 @@ from score_holdout import reproduce_val_indices
 from wireless_twin.data.map_loader import load_point_cloud
 from wireless_twin.data.setup_config import load_setup
 from wireless_twin.models.raytrace2 import build_heightmap
-from wireless_twin.signal import pas_spectrum_phv, pdp_spectrum
+from wireless_twin.signal import (
+    pas_spectrum,
+    pas_spectrum_phv,
+    pas_spectrum_pvh,
+    pdp_spectrum,
+)
 
 
 class SliceAttention(nn.Module):
@@ -155,6 +160,11 @@ def main() -> None:
     )
     parser.add_argument("--domains", default="pas,pdp")
     parser.add_argument(
+        "--pas-layout",
+        choices=("hvp", "pvh", "phv"),
+        default="phv",
+    )
+    parser.add_argument(
         "--pas-checkpoint-template",
         default=None,
         help="optional format string containing {seed} for panel PAS arms",
@@ -235,9 +245,10 @@ def main() -> None:
         )
         for seed in panel
     }
-    split_indices["testmatched"] = np.load(args.testmatched).astype(
-        np.int64
-    )
+    if args.testmatched:
+        split_indices["testmatched"] = np.load(args.testmatched).astype(
+            np.int64
+        )
     all_indices = np.arange(len(positions), dtype=np.int64)
 
     def checkpoint_path(domain: str, split_name: str) -> Path:
@@ -371,6 +382,7 @@ def main() -> None:
 
     payload: dict[str, object] = {
         "selection_policy": "four tune splits only",
+        "pas_layout": args.pas_layout,
         "tune_seeds": tune_seeds,
         "audit_seed": args.audit_seed,
         "correction_grid": corrections,
@@ -382,11 +394,16 @@ def main() -> None:
         "domains": {},
     }
     cache_names = {
-        "pas": "train_pas_phv.npy",
+        "pas": f"train_pas_{args.pas_layout}.npy",
         "pdp": "train_pdp.npy",
     }
+    pas_transforms = {
+        "hvp": pas_spectrum,
+        "pvh": pas_spectrum_pvh,
+        "phv": pas_spectrum_phv,
+    }
     transforms = {
-        "pas": pas_spectrum_phv,
+        "pas": pas_transforms[args.pas_layout],
         "pdp": pdp_spectrum,
     }
 
@@ -666,9 +683,13 @@ def main() -> None:
                         "audit": split_rows[str(args.audit_seed)][
                             "blend_scores"
                         ][str(correction)][str(blend)],
-                        "testmatched_expert": split_rows["testmatched"][
-                            "expert_scores"
-                        ][str(correction)],
+                        "testmatched_expert": (
+                            split_rows["testmatched"]["expert_scores"][
+                                str(correction)
+                            ]
+                            if "testmatched" in split_rows
+                            else None
+                        ),
                         "scores": {
                             split_name: row["blend_scores"][
                                 str(correction)

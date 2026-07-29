@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("--cache-dir", default="cache/teammate_knn_hvp")
     parser.add_argument(
         "--pas-layout",
-        choices=("hvp", "pvh", "phv"),
+        choices=("hvp", "hpv", "vhp", "vph", "phv", "pvh"),
         default="phv",
     )
     parser.add_argument("--batch-size", type=int, default=20)
@@ -48,71 +48,73 @@ def main() -> None:
         array = np.load(path, mmap_mode="r")
         return array.shape == shape and array.dtype == np.float32
 
-    if (
-        not args.force
-        and valid(pas_path, expected_pas)
-        and valid(pdp_path, expected_pdp)
-    ):
+    build_pas = args.force or not valid(pas_path, expected_pas)
+    build_pdp = args.force or not valid(pdp_path, expected_pdp)
+    if not build_pas and not build_pdp:
         print(f"[cache] reuse {pas_path} and {pdp_path}", flush=True)
         return
 
     pas_tmp = pas_path.with_name(f"{pas_path.stem}.tmp.npy")
     pdp_tmp = pdp_path.with_name(f"{pdp_path.stem}.tmp.npy")
-    pas = np.lib.format.open_memmap(
-        pas_tmp, mode="w+", dtype=np.float32, shape=expected_pas
+    pas = (
+        np.lib.format.open_memmap(
+            pas_tmp, mode="w+", dtype=np.float32, shape=expected_pas
+        )
+        if build_pas
+        else None
     )
-    pdp = np.lib.format.open_memmap(
-        pdp_tmp, mode="w+", dtype=np.float32, shape=expected_pdp
+    pdp = (
+        np.lib.format.open_memmap(
+            pdp_tmp, mode="w+", dtype=np.float32, shape=expected_pdp
+        )
+        if build_pdp
+        else None
     )
+    layout_size = {
+        "h": spec.mh,
+        "v": spec.mv,
+        "p": spec.mp,
+    }
     for start in range(0, len(channels), args.batch_size):
         stop = min(start + args.batch_size, len(channels))
         channel = np.asarray(
             channels[start:stop], dtype=np.complex64
         )
-        if args.pas_layout == "hvp":
+        if pas is not None:
             spatial = channel.reshape(
                 -1,
-                spec.mh,
-                spec.mv,
-                spec.mp,
+                *[layout_size[name] for name in args.pas_layout],
                 spec.n,
                 spec.s,
             )
-            angular = np.fft.fft2(spatial, axes=(1, 2))
+            axis = {
+                name: 1 + args.pas_layout.index(name)
+                for name in ("h", "v", "p")
+            }
+            canonical = spatial.transpose(
+                0, axis["h"], axis["v"], axis["p"], 4, 5
+            )
+            angular = np.fft.fft2(canonical, axes=(1, 2))
             spectrum = np.square(
                 np.abs(angular).astype(np.float32)
             ).sum(axis=3)
-        else:
-            first, second = (
-                (spec.mv, spec.mh)
-                if args.pas_layout == "pvh"
-                else (spec.mh, spec.mv)
+            pas[start:stop] = spectrum.reshape(
+                -1, spec.mh * spec.mv, spec.n, spec.s
+            ).transpose(0, 2, 3, 1)
+        if pdp is not None:
+            delay = np.fft.ifft(channel, axis=-1)
+            pdp[start:stop] = np.square(
+                np.abs(delay).astype(np.float32)
             )
-            spatial = channel.reshape(
-                -1,
-                spec.mp,
-                first,
-                second,
-                spec.n,
-                spec.s,
-            )
-            angular = np.fft.fft2(spatial, axes=(2, 3))
-            spectrum = np.square(
-                np.abs(angular).astype(np.float32)
-            ).sum(axis=1)
-        pas[start:stop] = spectrum.reshape(
-            -1, spec.mh * spec.mv, spec.n, spec.s
-        ).transpose(0, 2, 3, 1)
-        delay = np.fft.ifft(channel, axis=-1)
-        pdp[start:stop] = np.square(
-            np.abs(delay).astype(np.float32)
-        )
         print(f"[cache] {stop}/{len(channels)}", flush=True)
-    pas.flush()
-    pdp.flush()
-    del pas, pdp
-    os.replace(pas_tmp, pas_path)
-    os.replace(pdp_tmp, pdp_path)
+    if pas is not None:
+        pas.flush()
+        del pas
+        os.replace(pas_tmp, pas_path)
+    if pdp is not None:
+        pdp.flush()
+        del pdp
+        os.replace(pdp_tmp, pdp_path)
     print(
         f"SPECTRUM_CACHE_DONE pas={pas_path} pdp={pdp_path}",
         flush=True,

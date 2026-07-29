@@ -1,0 +1,66 @@
+{
+  "name": "BLEND_GS42_DUAL_LAYOUT",
+  "tune_seeds": [
+    1890,
+    3716,
+    962,
+    1022
+  ],
+  "audit_seed": 2262,
+  "source": {
+    "kind": "anisotropic_idw",
+    "k": 16,
+    "radial_ratio": 5.0,
+    "distance_power": 2.0,
+    "amplitude": "equalized"
+  },
+  "phase": {
+    "k0_rad_per_meter": -140.25,
+    "k1_rad_per_meter_per_subcarrier": -0.0006250000000000006,
+    "global_phase": -0.04592402783074322
+  },
+  "steering": {
+    "layout": "phv",
+    "theta": 1.0191372632980347,
+    "horizontal_coefficient": 3.1500604152679443,
+    "vertical_coefficient": -25.401906967163086
+  },
+  "projection": {
+    "order": "hvp_phv_pdp",
+    "iterations": 8,
+    "scale": 0.6131952165343779,
+    "residual_global_phase": -0.01898457890855341,
+    "phase_seed_epsilon": 0.001,
+    "tune_median": 0.767639132021841,
+    "audit": 0.7945911464152207,
+    "strict_audit": 0.8295575655620422
+  },
+  "pas": {
+    "k": 16,
+    "correction": 1.0,
+    "radial_multiplier": 0.45,
+    "tangent_multiplier": 1.0,
+    "blend": 0.8,
+    "transport": {
+      "k": 16,
+      "distance_power": 2.0,
+      "blend": 0.25,
+      "gate_checkpoint": "checkpoints/pas_transport_gate/selected.pt"
+    },
+    "hvp": {
+      "k": 32,
+      "correction": 0.5,
+      "radial_multiplier": 1.0,
+      "tangent_multiplier": 1.0,
+      "blend": 1.0,
+      "checkpoint_template": "checkpoints/clean_panel/s{seed}/nbrattn_clean_k32_pas_k32s0.pt"
+    }
+  },
+  "pdp": {
+    "k": 32,
+    "correction": 0.8,
+    "radial_multiplier": 1.0,
+    "tangent_multiplier": 1.0,
+    "blend": 0.4
+  }
+}

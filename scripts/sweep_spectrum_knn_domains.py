@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default="cache/teammate_knn_hvp")
     parser.add_argument(
         "--pas-layout",
-        choices=("hvp", "pvh", "phv"),
+        choices=("hvp", "hpv", "vhp", "vph", "phv", "pvh"),
         default="hvp",
     )
     parser.add_argument("--panel", default="1890,3716,962,1022,2262")
