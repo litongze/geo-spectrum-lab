@@ -12,10 +12,18 @@ from scipy.spatial import cKDTree
 
 from _bootstrap import ROOT  # noqa: F401
 from score_holdout import reproduce_val_indices
+from sweep_rayprofile_spectrum_knn import (
+    local_multiscale_radial_profiles,
+    local_radial_profiles,
+)
 from validate_moment_projection import enforce_pdp, stable_unit
+from wireless_twin.data.map_loader import load_point_cloud
 from wireless_twin.data.setup_config import load_setup
+from wireless_twin.models.raytrace2 import build_heightmap
 from wireless_twin.signal import (
+    pas_spectrum,
     pas_spectrum_phv,
+    pas_spectrum_pvh,
     pdp_spectrum,
 )
 
@@ -46,6 +54,21 @@ def main() -> None:
     parser.add_argument("--distance-power", type=float, default=0.5)
     parser.add_argument("--anchor-strength", type=float, default=4.0)
     parser.add_argument(
+        "--neighbor-profile",
+        choices=(
+            "none",
+            "radial_height",
+            "radial_combined",
+            "radial_multiscale_height",
+            "radial_multiscale_mean",
+            "radial_multiscale_occupancy",
+            "radial_multiscale_height_occupancy",
+            "radial_multiscale_all",
+        ),
+        default="none",
+    )
+    parser.add_argument("--profile-lambda", type=float, default=0.0)
+    parser.add_argument(
         "--target-beta-grid", default="0,0.025,0.05,0.075,0.1,0.15"
     )
     parser.add_argument(
@@ -53,6 +76,12 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--pas-layout",
+        choices=("phv", "hvp", "pvh"),
+        default="phv",
+        help="PAS layout used for reporting the combined score",
+    )
     parser.add_argument(
         "--out",
         default="docs/postprojection_bilateral_pdp/result.json",
@@ -73,6 +102,24 @@ def main() -> None:
     positions = np.load(
         datadir / "Round1_Train_Pos.npy"
     ).astype(np.float32)
+    profiles = None
+    if args.neighbor_profile != "none":
+        points = load_point_cloud(datadir / "Round1_Map.ply")
+        heightmap, x0, y0, resolution = build_heightmap(points)
+        profile_builder = (
+            local_multiscale_radial_profiles
+            if args.neighbor_profile.startswith("radial_multiscale")
+            else local_radial_profiles
+        )
+        profiles = profile_builder(
+            positions,
+            np.asarray(spec.bs_position, dtype=np.float32),
+            heightmap,
+            x0,
+            y0,
+            resolution,
+        )[args.neighbor_profile]
+        del points, heightmap
     tune_union = {
         int(index)
         for name in tune
@@ -84,6 +131,11 @@ def main() -> None:
         datadir / "Round1_Train_Channel.npy", mmap_mode="r"
     )
     device = torch.device(args.device)
+    pas_transform = {
+        "phv": pas_spectrum_phv,
+        "hvp": pas_spectrum,
+        "pvh": pas_spectrum_pvh,
+    }[args.pas_layout]
     cached = np.load(
         Path(args.cache_dir) / "train_pdp.npy", mmap_mode="r"
     )
@@ -110,11 +162,51 @@ def main() -> None:
                 dtype=np.int64,
             )
             pool_idx = np.setdiff1d(all_idx, val_idx)
-            distance, local = cKDTree(
-                positions[pool_idx, :2]
-            ).query(positions[val_idx, :2], k=args.k)
-            distance = np.asarray(distance, dtype=np.float32)
-            neighbor_idx = pool_idx[np.asarray(local)]
+            if profiles is None:
+                distance, local = cKDTree(
+                    positions[pool_idx, :2]
+                ).query(positions[val_idx, :2], k=args.k)
+                distance = np.asarray(distance, dtype=np.float32)
+                neighbor_idx = pool_idx[np.asarray(local)]
+            else:
+                xy_delta = (
+                    positions[val_idx, None, :2]
+                    - positions[pool_idx][None, :, :2]
+                )
+                spatial_distance2 = np.square(xy_delta).sum(axis=-1)
+                profile_scale = profiles[pool_idx].std(
+                    axis=0
+                ).clip(0.05)
+                profile_delta = (
+                    profiles[val_idx, None]
+                    - profiles[pool_idx][None]
+                ) / profile_scale
+                profile_distance2 = np.square(profile_delta).mean(
+                    axis=-1
+                )
+                effective_distance2 = (
+                    spatial_distance2
+                    + args.profile_lambda**2 * profile_distance2
+                )
+                local = np.argpartition(
+                    effective_distance2,
+                    kth=args.k - 1,
+                    axis=1,
+                )[:, : args.k]
+                selected_effective = np.take_along_axis(
+                    effective_distance2, local, axis=1
+                )
+                order = np.argsort(selected_effective, axis=1)
+                local = np.take_along_axis(local, order, axis=1)
+                neighbor_idx = pool_idx[local]
+                distance = np.sqrt(
+                    np.maximum(
+                        np.take_along_axis(
+                            spatial_distance2, local, axis=1
+                        ),
+                        1e-6,
+                    )
+                ).astype(np.float32)
             prediction = np.load(
                 args.prediction_template.format(seed=name),
                 mmap_mode="r",
@@ -187,7 +279,7 @@ def main() -> None:
                     pdp_spectrum(predicted, spec)
                 )
                 truth_pas = stable_unit(
-                    pas_spectrum_phv(truth, spec)
+                    pas_transform(truth, spec)
                 )
                 truth_pdp = stable_unit(pdp_spectrum(truth, spec))
                 truth_energy = float(
@@ -205,7 +297,7 @@ def main() -> None:
                             + channel_mix * corrected
                         )
                         output_pas = stable_unit(
-                            pas_spectrum_phv(output, spec)
+                            pas_transform(output, spec)
                         )
                         output_pdp = stable_unit(
                             pdp_spectrum(output, spec)
@@ -367,7 +459,10 @@ def main() -> None:
         ),
         "distance_power": args.distance_power,
         "anchor_strength": args.anchor_strength,
+        "neighbor_profile": args.neighbor_profile,
+        "profile_lambda": args.profile_lambda,
         "prediction_template": args.prediction_template,
+        "pas_layout": args.pas_layout,
         "best": rows[0],
         "best_robust": robust[0] if robust else None,
         "ranked": rows,

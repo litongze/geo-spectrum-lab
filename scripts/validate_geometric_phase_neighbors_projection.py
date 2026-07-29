@@ -25,6 +25,7 @@ from neighbor_source_weights import (
 )
 from probe_full_array_steering_phase import array_steering_phase
 from score_holdout import reproduce_val_indices
+from train_covariance_kriging import CorrelationPredictor
 from validate_moment_projection import (
     enforce_pas,
     enforce_pas_layout,
@@ -139,6 +140,31 @@ def main() -> None:
         default=0.0,
     )
     parser.add_argument(
+        "--covariance-kriging-dir",
+        help=(
+            "optional directory containing clean s{seed}.pt complex "
+            "correlation predictors"
+        ),
+    )
+    parser.add_argument(
+        "--covariance-kriging-source",
+        default="anis_k16_r5_p2_equalized",
+    )
+    parser.add_argument(
+        "--covariance-kriging-loading", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--covariance-kriging-blend-grid", default="0.5"
+    )
+    parser.add_argument(
+        "--covariance-kriging-hybrid-grid",
+        default="",
+        help=(
+            "optional residual fractions added to the complex-gate source: "
+            "gate + alpha * (kriging - baseline)"
+        ),
+    )
+    parser.add_argument(
         "--angle-delay-source",
         help=(
             "optional source configuration replaced by grouped PHV "
@@ -221,6 +247,12 @@ def main() -> None:
         help="also report HVP and PVH PAS scores without changing selection",
     )
     parser.add_argument(
+        "--score-pas-layout",
+        choices=("phv", "hvp", "pvh"),
+        default="phv",
+        help="PAS layout used for candidate ranking and the reported C score",
+    )
+    parser.add_argument(
         "--save-prediction",
         help=(
             "exact candidate name whose raw projected channels should be "
@@ -279,6 +311,68 @@ def main() -> None:
             )
         )
         source_specs.append(gate_source)
+    kriging_sources = []
+    if args.covariance_kriging_dir:
+        matching_sources = [
+            source
+            for source in source_specs
+            if source["name"] == args.covariance_kriging_source
+        ]
+        if len(matching_sources) != 1:
+            raise ValueError(
+                "--covariance-kriging-source must occur exactly once "
+                "in --sources"
+            )
+        for blend_text in args.covariance_kriging_blend_grid.split(","):
+            if not blend_text:
+                continue
+            blend = float(blend_text)
+            if not 0.0 <= blend <= 1.0:
+                raise ValueError(
+                    "covariance kriging blend must be in [0, 1]"
+                )
+            kriging_source = dict(matching_sources[0])
+            kriging_source["kriging_base_name"] = (
+                kriging_source["name"]
+            )
+            kriging_source["kriging_blend"] = blend
+            kriging_source["name"] = (
+                f"{kriging_source['name']}_ckrig_l"
+                f"{args.covariance_kriging_loading:g}_b{blend:g}"
+            )
+            source_specs.append(kriging_source)
+            kriging_sources.append(kriging_source)
+    if args.covariance_kriging_hybrid_grid:
+        if not args.complex_gate_dir or not kriging_sources:
+            raise ValueError(
+                "covariance kriging hybrids require both gate and "
+                "kriging sources"
+            )
+        for alpha_text in args.covariance_kriging_hybrid_grid.split(","):
+            if not alpha_text:
+                continue
+            alpha = float(alpha_text)
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError(
+                    "covariance kriging hybrid alpha must be in [0, 1]"
+                )
+            for kriging_source in kriging_sources:
+                hybrid_source = dict(matching_sources[0])
+                hybrid_source["phase_lookup_name"] = (
+                    matching_sources[0]["name"]
+                )
+                hybrid_source["hybrid_components"] = {
+                    "gate": gate_source["name"],
+                    "kriging": kriging_source["name"],
+                    "baseline": matching_sources[0]["name"],
+                    "alpha": alpha,
+                }
+                hybrid_source["name"] = (
+                    f"{gate_source['name']}_ckres"
+                    f"{kriging_source['kriging_blend']:g}"
+                    f"_a{alpha:g}"
+                )
+                source_specs.append(hybrid_source)
     if args.angle_delay_source:
         matching_sources = [
             source
@@ -351,8 +445,13 @@ def main() -> None:
         neighbor_name = source.get(
             "phase_lookup_name",
             source.get(
-                "gate_base_name",
-                source.get("angle_delay_base_name", source["name"]),
+                "kriging_base_name",
+                source.get(
+                    "gate_base_name",
+                    source.get(
+                        "angle_delay_base_name", source["name"]
+                    ),
+                ),
             ),
         )
         source["initial_global_phase"] = float(
@@ -383,6 +482,11 @@ def main() -> None:
     subcarrier = np.arange(spec.s, dtype=np.float64)
     subcarrier -= subcarrier.mean()
     sufficient = {}
+    score_pas_transform = {
+        "phv": pas_spectrum_phv,
+        "hvp": pas_spectrum,
+        "pvh": pas_spectrum_pvh,
+    }[args.score_pas_layout]
 
     def record(
         name: str,
@@ -409,7 +513,7 @@ def main() -> None:
             truth_pas = truth_pas[keep]
             truth_pdp = truth_pdp[keep]
         prediction_pas = stable_unit(
-            pas_spectrum_phv(prediction, spec)
+            score_pas_transform(prediction, spec)
         )
         prediction_pdp = stable_unit(pdp_spectrum(prediction, spec))
         sufficient.setdefault(name, {})[seed] = {
@@ -531,6 +635,41 @@ def main() -> None:
                         ),
                     }
                 )
+        kriging_component = None
+        if args.covariance_kriging_dir:
+            kriging_checkpoint = torch.load(
+                Path(args.covariance_kriging_dir) / f"s{seed}.pt",
+                map_location=device,
+                weights_only=False,
+            )
+            kriging_names = tuple(
+                kriging_checkpoint["feature_names"]
+            )
+            kriging_model = CorrelationPredictor(
+                int(kriging_checkpoint["feature_dim"]),
+                int(kriging_checkpoint["hidden_dim"]),
+            ).to(device)
+            kriging_model.load_state_dict(
+                kriging_checkpoint["model_state"]
+            )
+            kriging_model.eval()
+            kriging_component = {
+                "model": kriging_model,
+                "indices": [
+                    FEATURE_NAMES.index(item)
+                    for item in kriging_names
+                ],
+                "mean": torch.as_tensor(
+                    kriging_checkpoint["feature_mean"],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "std": torch.as_tensor(
+                    kriging_checkpoint["feature_std"],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
 
         truth = torch.as_tensor(
             np.array(channels[val_idx], copy=True),
@@ -645,6 +784,8 @@ def main() -> None:
                     .numpy()
                 )
                 for source in source_specs:
+                    if "hybrid_components" in source:
+                        continue
                     k = source["k"]
                     if k == 1:
                         weight = np.ones((batch, 1), dtype=np.float64)
@@ -757,7 +898,113 @@ def main() -> None:
                             * consensus_channel
                         )
                         continue
-                    if "gate_base_name" in source:
+                    if "kriging_base_name" in source:
+                        if kriging_component is None:
+                            raise RuntimeError(
+                                "covariance kriging model was not loaded"
+                            )
+                        source_flat = neighbors[:, :k].reshape(
+                            batch, k, -1
+                        )
+                        gram = torch.einsum(
+                            "bil,bjl->bij",
+                            source_flat.conj(),
+                            source_flat,
+                        )
+                        base_weight_t = torch.as_tensor(
+                            weight,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        gate_features, gate_amplitude = (
+                            build_complex_features(
+                                gram,
+                                base_weight_t,
+                                torch.as_tensor(
+                                    distance[start:stop, :k],
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                                torch.as_tensor(
+                                    effective,
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                                torch.as_tensor(
+                                    radial_delta[start:stop, :k],
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                                torch.as_tensor(
+                                    tangent_delta[start:stop, :k],
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                                torch.as_tensor(
+                                    positions[val_idx[start:stop]],
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                                torch.as_tensor(
+                                    bs,
+                                    dtype=torch.float32,
+                                    device=device,
+                                ),
+                            )
+                        )
+                        correlation = gram / (
+                            gate_amplitude[:, :, None]
+                            * gate_amplitude[:, None, :]
+                        ).clamp_min(1e-30)
+                        prior = torch.einsum(
+                            "bij,bj->bi",
+                            correlation,
+                            base_weight_t.to(torch.complex64),
+                        )
+                        normalized_features = (
+                            (
+                                gate_features[
+                                    ..., kriging_component["indices"]
+                                ]
+                                - kriging_component["mean"]
+                            )
+                            / kriging_component["std"]
+                        ).clamp(-8.0, 8.0)
+                        predicted_correlation = kriging_component[
+                            "model"
+                        ](normalized_features, prior)
+                        loading = args.covariance_kriging_loading
+                        identity = torch.eye(
+                            k,
+                            dtype=torch.complex64,
+                            device=device,
+                        )[None]
+                        solved = torch.linalg.solve(
+                            correlation + loading * identity,
+                            (
+                                predicted_correlation
+                                + loading
+                                * base_weight_t.to(torch.complex64)
+                            )[..., None],
+                        )[..., 0]
+                        blend = float(source["kriging_blend"])
+                        normalized_weight = (
+                            base_weight_t.to(torch.complex64)
+                            + blend
+                            * (
+                                solved
+                                - base_weight_t.to(torch.complex64)
+                            )
+                        )
+                        target_amplitude = (
+                            base_weight_t * gate_amplitude
+                        ).sum(dim=1, keepdim=True)
+                        weight_t = (
+                            normalized_weight
+                            * target_amplitude
+                            / gate_amplitude.clamp_min(1e-30)
+                        )
+                    elif "gate_base_name" in source:
                         if not gate_components:
                             raise RuntimeError(
                                 "complex gate was not loaded"
@@ -869,6 +1116,18 @@ def main() -> None:
                         )
                     )
                 del neighbors
+        for source in source_specs:
+            components = source.get("hybrid_components")
+            if components is None:
+                continue
+            sources[source["name"]] = (
+                sources[components["gate"]]
+                + float(components["alpha"])
+                * (
+                    sources[components["kriging"]]
+                    - sources[components["baseline"]]
+                )
+            )
 
         baseline = torch.as_tensor(
             np.array(
@@ -950,7 +1209,7 @@ def main() -> None:
                     (1.0 - hvp_blend) * baseline_hvp
                     + hvp_blend * expert_hvp
                 )
-        truth_pas = stable_unit(pas_spectrum_phv(truth, spec))
+        truth_pas = stable_unit(score_pas_transform(truth, spec))
         truth_pdp = stable_unit(pdp_spectrum(truth, spec))
         record(
             "baseline_none_i0",
@@ -1052,7 +1311,10 @@ def main() -> None:
             for hvp_blend, target_hvp in target_hvp_by_blend.items():
                 for dual_order in dual_orders:
                     steps = dual_order.split("_")
-                    if sorted(steps) != ["hvp", "pdp", "phv"]:
+                    if sorted(steps) not in (
+                        ["hvp", "pdp"],
+                        ["hvp", "pdp", "phv"],
+                    ):
                         raise ValueError(
                             f"invalid dual projection order {dual_order}"
                         )
@@ -1256,6 +1518,13 @@ def main() -> None:
                 args.complex_gate_secondary_alpha
             ),
         },
+        "covariance_kriging": {
+            "directory": args.covariance_kriging_dir,
+            "source": args.covariance_kriging_source,
+            "diagonal_loading": args.covariance_kriging_loading,
+            "blend_grid": args.covariance_kriging_blend_grid,
+            "hybrid_grid": args.covariance_kriging_hybrid_grid,
+        },
         "angle_delay_consensus": {
             "source": args.angle_delay_source,
             "layout": "phv",
@@ -1271,6 +1540,7 @@ def main() -> None:
         "audit_seed": args.audit_seed,
         "strict_audit": args.strict_audit,
         "reported_pas_layouts": args.report_pas_layouts,
+        "score_pas_layout": args.score_pas_layout,
         "hvp_expert_dir": args.hvp_expert_dir,
         "hvp_blend_grid": hvp_blends if args.hvp_expert_dir else [],
         "dual_orders": dual_orders if args.hvp_expert_dir else [],

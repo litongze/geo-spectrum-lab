@@ -32,7 +32,9 @@ from pas_transport_gate import (
     build_gate_features,
 )
 from probe_array_steering_phase import array_coordinates
+from sweep_rayprofile_spectrum_knn import local_radial_profiles
 from sweep_moment_attention import SliceAttention, moment_project, stable_unit
+from train_covariance_kriging import CorrelationPredictor
 from validate_moment_projection import enforce_pas, enforce_pdp
 from validate_moment_projection import enforce_pas_layout
 from wireless_twin.data.map_loader import load_point_cloud
@@ -172,6 +174,8 @@ def main() -> None:
     if projection_order not in {
         "pas_pdp",
         "pdp_pas",
+        "hvp_pdp",
+        "pdp_hvp",
         "hvp_phv_pdp",
         "phv_hvp_pdp",
         "hvp_pdp_phv",
@@ -293,6 +297,74 @@ def main() -> None:
                     ),
                 }
             )
+    covariance_config = config.get("covariance_kriging")
+    covariance_component = None
+    if covariance_config is not None:
+        if source_k <= 1:
+            raise ValueError(
+                "covariance kriging requires a multi-neighbor source"
+            )
+        loading = float(covariance_config["diagonal_loading"])
+        blend = float(covariance_config["blend"])
+        residual_alpha = float(covariance_config["residual_alpha"])
+        if loading < 0.0:
+            raise ValueError(
+                "covariance kriging diagonal loading must be non-negative"
+            )
+        if not 0.0 <= blend <= 1.0:
+            raise ValueError(
+                "covariance kriging blend must be in [0, 1]"
+            )
+        if not 0.0 <= residual_alpha <= 1.0:
+            raise ValueError(
+                "covariance kriging residual alpha must be in [0, 1]"
+            )
+        covariance_path = Path(covariance_config["checkpoint"])
+        covariance_payload = torch.load(
+            covariance_path,
+            map_location=device,
+            weights_only=False,
+        )
+        covariance_names = tuple(
+            covariance_payload["feature_names"]
+        )
+        unknown_features = set(covariance_names).difference(
+            COMPLEX_GATE_FEATURE_NAMES
+        )
+        if unknown_features:
+            raise ValueError(
+                "unknown covariance kriging features: "
+                f"{sorted(unknown_features)}"
+            )
+        covariance_model = CorrelationPredictor(
+            int(covariance_payload["feature_dim"]),
+            int(covariance_payload["hidden_dim"]),
+        ).to(device)
+        covariance_model.load_state_dict(
+            covariance_payload["model_state"]
+        )
+        covariance_model.eval()
+        covariance_component = {
+            "path": covariance_path,
+            "loading": loading,
+            "blend": blend,
+            "residual_alpha": residual_alpha,
+            "indices": [
+                COMPLEX_GATE_FEATURE_NAMES.index(name)
+                for name in covariance_names
+            ],
+            "model": covariance_model,
+            "mean": torch.as_tensor(
+                covariance_payload["feature_mean"],
+                dtype=torch.float32,
+                device=device,
+            ),
+            "std": torch.as_tensor(
+                covariance_payload["feature_std"],
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
     pas_transport = config["pas"].get("transport")
     transport_k = (
         int(pas_transport["k"]) if pas_transport is not None else 0
@@ -487,7 +559,7 @@ def main() -> None:
                     ridge=float(moment_config["ridge"]),
                     strength=float(moment_config["strength"]),
                 )
-        if complex_gate_components:
+        if complex_gate_components or covariance_component is not None:
             source_flat = neighbors.reshape(batch, source_k, -1)
             gram = torch.einsum(
                 "bil,bjl->bij",
@@ -565,6 +637,61 @@ def main() -> None:
                         weight_t += component["alpha"] * (
                             learned_weight - baseline_weight
                         )
+                if covariance_component is not None:
+                    correlation = gram / (
+                        gate_amplitude[:, :, None]
+                        * gate_amplitude[:, None, :]
+                    ).clamp_min(1e-30)
+                    prior = torch.einsum(
+                        "bij,bj->bi",
+                        correlation,
+                        base_weight_t.to(torch.complex64),
+                    )
+                    normalized_features = (
+                        (
+                            gate_features[
+                                ..., covariance_component["indices"]
+                            ]
+                            - covariance_component["mean"]
+                        )
+                        / covariance_component["std"]
+                    ).clamp(-8.0, 8.0)
+                    predicted_correlation = covariance_component[
+                        "model"
+                    ](normalized_features, prior)
+                    loading = covariance_component["loading"]
+                    identity = torch.eye(
+                        source_k,
+                        dtype=torch.complex64,
+                        device=device,
+                    )[None]
+                    solved = torch.linalg.solve(
+                        correlation + loading * identity,
+                        (
+                            predicted_correlation
+                            + loading
+                            * base_weight_t.to(torch.complex64)
+                        )[..., None],
+                    )[..., 0]
+                    normalized_weight = (
+                        base_weight_t.to(torch.complex64)
+                        + covariance_component["blend"]
+                        * (
+                            solved
+                            - base_weight_t.to(torch.complex64)
+                        )
+                    )
+                    target_amplitude = (
+                        base_weight_t * gate_amplitude
+                    ).sum(dim=1, keepdim=True)
+                    kriging_weight = (
+                        normalized_weight
+                        * target_amplitude
+                        / gate_amplitude.clamp_min(1e-30)
+                    )
+                    weight_t += covariance_component[
+                        "residual_alpha"
+                    ] * (kriging_weight - baseline_weight)
         else:
             if source_config.get("amplitude", "raw") == "equalized":
                 energy = (
@@ -655,6 +782,11 @@ def main() -> None:
             )
             for component in complex_gate_components
         }
+    if covariance_component is not None:
+        manifest["covariance_kriging"] = (
+            f"{covariance_component['path']}:"
+            f"{sha256(covariance_component['path'])}"
+        )
 
     def build_features(
         spectra: torch.Tensor,
@@ -802,8 +934,107 @@ def main() -> None:
         )
 
     hvp_target_config = config["pas"].get("hvp")
-    post_bilateral_config = config["pdp"].get("post_bilateral")
-    post_bilateral_pdp = None
+    post_bilateral_configs = {
+        "pas": config["pas"].get("post_bilateral"),
+        "pdp": config["pdp"].get("post_bilateral"),
+        "hvp": (
+            hvp_target_config.get("post_bilateral")
+            if hvp_target_config is not None
+            else None
+        ),
+    }
+    post_bilateral_targets = {}
+    post_bilateral_neighbors = {}
+    post_bilateral_distances = {}
+    supported_profiles = {"radial_height", "radial_combined"}
+    requested_profiles = {
+        str(domain_config.get("neighbor_profile", "none"))
+        for domain_config in post_bilateral_configs.values()
+        if domain_config is not None
+        and str(domain_config.get("neighbor_profile", "none"))
+        != "none"
+    }
+    unknown_profiles = requested_profiles.difference(
+        supported_profiles
+    )
+    if unknown_profiles:
+        raise ValueError(
+            "unsupported post-bilateral neighbor profiles: "
+            f"{sorted(unknown_profiles)}"
+        )
+    profile_bank = {}
+    if requested_profiles:
+        all_profile_bank = local_radial_profiles(
+            np.concatenate([train_pos, test_pos], axis=0),
+            bs.astype(np.float32),
+            heightmap,
+            x0,
+            y0,
+            resolution,
+        )
+        profile_bank = {
+            name: all_profile_bank[name]
+            for name in requested_profiles
+        }
+        del all_profile_bank
+    for domain, domain_config in post_bilateral_configs.items():
+        if domain_config is None:
+            continue
+        neighbor_profile = str(
+            domain_config.get("neighbor_profile", "none")
+        )
+        if neighbor_profile == "none":
+            continue
+        profile_lambda = float(
+            domain_config.get("profile_lambda", 0.0)
+        )
+        all_profiles = profile_bank[neighbor_profile]
+        train_profile = all_profiles[: len(train_pos)]
+        test_profile = all_profiles[len(train_pos) :]
+        profile_scale = train_profile.std(axis=0).clip(0.05)
+        xy_delta = (
+            test_pos[:, None, :2] - train_pos[None, :, :2]
+        )
+        spatial_distance2 = np.square(xy_delta).sum(axis=-1)
+        profile_delta = (
+            test_profile[:, None] - train_profile[None]
+        ) / profile_scale
+        effective_distance2 = (
+            spatial_distance2
+            + profile_lambda**2
+            * np.square(profile_delta).mean(axis=-1)
+        )
+        bilateral_k = int(domain_config.get("k", 32))
+        local = np.argpartition(
+            effective_distance2,
+            kth=bilateral_k - 1,
+            axis=1,
+        )[:, :bilateral_k]
+        selected_effective = np.take_along_axis(
+            effective_distance2, local, axis=1
+        )
+        order = np.argsort(selected_effective, axis=1)
+        local = np.take_along_axis(local, order, axis=1)
+        post_bilateral_neighbors[domain] = local.astype(np.int64)
+        post_bilateral_distances[domain] = np.sqrt(
+            np.maximum(
+                np.take_along_axis(
+                    spatial_distance2, local, axis=1
+                ),
+                1e-6,
+            )
+        ).astype(np.float32)
+        del (
+            train_profile,
+            test_profile,
+            xy_delta,
+            spatial_distance2,
+            profile_delta,
+            effective_distance2,
+            selected_effective,
+            local,
+        )
+    del profile_bank
     experts = {}
     expert_domains = ["pas", "pdp"]
     if hvp_target_config is not None:
@@ -848,11 +1079,13 @@ def main() -> None:
         )
         distance = np.asarray(distance, dtype=np.float32)
         neighbors = pool_idx[np.asarray(local)]
-        if domain == "pdp" and post_bilateral_config is not None:
-            bilateral_k = int(post_bilateral_config.get("k", 32))
+        post_bilateral_config = post_bilateral_configs.get(domain)
+        if post_bilateral_config is not None:
+            bilateral_k = int(post_bilateral_config.get("k", k))
             if bilateral_k > k:
                 raise ValueError(
-                    "post-bilateral PDP K exceeds PDP expert K: "
+                    f"post-bilateral {domain.upper()} K exceeds "
+                    f"{domain.upper()} expert K: "
                     f"{bilateral_k} > {k}"
                 )
             distance_power = float(
@@ -861,12 +1094,22 @@ def main() -> None:
             anchor_strength = float(
                 post_bilateral_config["anchor_strength"]
             )
+            bilateral_neighbors = (
+                post_bilateral_neighbors[domain]
+                if domain in post_bilateral_neighbors
+                else neighbors[:, :bilateral_k]
+            )
+            bilateral_distance = (
+                post_bilateral_distances[domain]
+                if domain in post_bilateral_distances
+                else distance[:, :bilateral_k]
+            )
             bilateral_chunks = []
             with torch.inference_mode():
                 for start in range(0, len(test_pos), args.batch_size):
                     stop = min(start + args.batch_size, len(test_pos))
                     neighbor_t = torch.as_tensor(
-                        neighbors[start:stop, :bilateral_k],
+                        bilateral_neighbors[start:stop],
                         dtype=torch.long,
                         device=device,
                     )
@@ -875,7 +1118,7 @@ def main() -> None:
                         values * values[:, :1]
                     ).sum(dim=-1).mean(dim=(2, 3))
                     distance_t = torch.as_tensor(
-                        distance[start:stop, :bilateral_k],
+                        bilateral_distance[start:stop],
                         dtype=torch.float32,
                         device=device,
                     ).clamp_min(0.3)
@@ -891,10 +1134,17 @@ def main() -> None:
                             )
                         )
                     )
-            post_bilateral_pdp = torch.cat(bilateral_chunks)
-            manifest["post_bilateral_pdp"] = {
+            post_bilateral_targets[domain] = torch.cat(
+                bilateral_chunks
+            )
+            manifest[f"post_bilateral_{domain}"] = {
                 **post_bilateral_config,
-                "selection": "source-only nearest-global agreement",
+                "selection": (
+                    "source-only nearest-global agreement with "
+                    "label-free map profile metric"
+                    if domain in post_bilateral_neighbors
+                    else "source-only nearest-global agreement"
+                ),
             }
         expert_sum = torch.zeros(
             (len(test_pos),) + tuple(spectra.shape[1:]),
@@ -1084,6 +1334,8 @@ def main() -> None:
     projection_steps = {
         "pas_pdp": ("phv", "pdp"),
         "pdp_pas": ("pdp", "phv"),
+        "hvp_pdp": ("hvp", "pdp"),
+        "pdp_hvp": ("pdp", "hvp"),
         "hvp_phv_pdp": ("hvp", "phv", "pdp"),
         "phv_hvp_pdp": ("phv", "hvp", "pdp"),
         "hvp_pdp_phv": ("hvp", "pdp", "phv"),
@@ -1136,34 +1388,76 @@ def main() -> None:
             (1.0 - source_blend) * source
             + source_blend * prediction
         )
-    if post_bilateral_config is not None:
-        if post_bilateral_pdp is None:
-            raise RuntimeError("post-bilateral PDP target was not built")
-        target_beta = float(post_bilateral_config["target_beta"])
-        channel_mix = float(
-            post_bilateral_config.get("channel_mix", 1.0)
+    configured_post_domains = [
+        domain
+        for domain in ("pas", "pdp", "hvp")
+        if post_bilateral_configs[domain] is not None
+    ]
+    post_bilateral_order = config["projection"].get(
+        "post_bilateral_order", configured_post_domains
+    )
+    if sorted(post_bilateral_order) != sorted(
+        configured_post_domains
+    ):
+        raise ValueError(
+            "projection.post_bilateral_order must contain each "
+            "configured spectral post-bilateral correction once"
         )
+    for domain in post_bilateral_order:
+        domain_config = post_bilateral_configs[domain]
+        if domain not in post_bilateral_targets:
+            raise RuntimeError(
+                f"post-bilateral {domain.upper()} target was not built"
+            )
+        target_beta = float(domain_config["target_beta"])
+        channel_mix = float(domain_config.get("channel_mix", 1.0))
         if not 0.0 <= target_beta <= 1.0:
             raise ValueError(
-                "post-bilateral PDP target_beta must be in [0, 1]"
+                f"post-bilateral {domain.upper()} target_beta "
+                "must be in [0, 1]"
             )
         if not 0.0 <= channel_mix <= 1.0:
             raise ValueError(
-                "post-bilateral PDP channel_mix must be in [0, 1]"
+                f"post-bilateral {domain.upper()} channel_mix "
+                "must be in [0, 1]"
             )
-        current_pdp = stable_unit(pdp_spectrum(prediction, spec))
+        if domain == "pas":
+            current_spectrum = stable_unit(
+                pas_spectrum_phv(prediction, spec)
+            )
+        elif domain == "pdp":
+            current_spectrum = stable_unit(
+                pdp_spectrum(prediction, spec)
+            )
+        else:
+            current_spectrum = stable_unit(
+                pas_spectrum(prediction, spec)
+            )
         bilateral_target = stable_unit(
-            (1.0 - target_beta) * current_pdp
-            + target_beta * post_bilateral_pdp
+            (1.0 - target_beta) * current_spectrum
+            + target_beta * post_bilateral_targets[domain]
         )
-        bilateral_prediction = enforce_pdp(
-            prediction, bilateral_target
-        )
+        if domain == "pas":
+            bilateral_prediction = enforce_pas(
+                prediction, bilateral_target, spec
+            )
+        elif domain == "pdp":
+            bilateral_prediction = enforce_pdp(
+                prediction, bilateral_target
+            )
+        else:
+            bilateral_prediction = enforce_pas_layout(
+                prediction, bilateral_target, spec, "hvp"
+            )
         prediction = (
             (1.0 - channel_mix) * prediction
             + channel_mix * bilateral_prediction
         )
-        del current_pdp, bilateral_target, bilateral_prediction
+        del (
+            current_spectrum,
+            bilateral_target,
+            bilateral_prediction,
+        )
     prediction *= torch.tensor(
         output_scale * np.exp(1j * residual_global_phase),
         dtype=torch.complex64,
@@ -1240,6 +1534,7 @@ def main() -> None:
             "phase_seed_epsilon": args.phase_seed_epsilon,
             "source": source_config,
             "complex_neighbor_gate": complex_gate_config,
+            "covariance_kriging": covariance_config,
             "steering": steering_config,
             "nearest_xy_distance": {
                 "mean": float(nearest_distance.mean()),
@@ -1262,6 +1557,7 @@ def main() -> None:
             "transport": pas_transport,
             "transport_gate": transport_gate_stats,
             "hvp": hvp_target_config,
+            "post_bilateral": post_bilateral_configs["pas"],
         },
         "pdp": {
             "k": 32,
@@ -1269,9 +1565,10 @@ def main() -> None:
             "radial_multiplier": args.pdp_radial,
             "tangent_multiplier": args.pdp_tangent,
             "blend": args.pdp_blend,
-            "post_bilateral": post_bilateral_config,
+            "post_bilateral": post_bilateral_configs["pdp"],
         },
         "projection_order": projection_order,
+        "post_bilateral_order": post_bilateral_order,
         "dual_mix": dual_mix,
         "source_blend": source_blend,
         "iterations": args.iterations,
@@ -1346,14 +1643,39 @@ def main() -> None:
             else ""
         )
         + (
-            "PDP 谱形一致性后投影: "
-            f"K={post_bilateral_config.get('k', 32)}, "
+            "PAS 谱形一致性后投影: "
+            f"K={post_bilateral_configs['pas'].get('k', 16)}, "
             "distance_power="
-            f"{post_bilateral_config['distance_power']}, "
+            f"{post_bilateral_configs['pas']['distance_power']}, "
             "anchor_strength="
-            f"{post_bilateral_config['anchor_strength']}, "
-            f"target_beta={post_bilateral_config['target_beta']}。\n"
-            if post_bilateral_config is not None
+            f"{post_bilateral_configs['pas']['anchor_strength']}, "
+            "target_beta="
+            f"{post_bilateral_configs['pas']['target_beta']}。\n"
+            if post_bilateral_configs["pas"] is not None
+            else ""
+        )
+        + (
+            "HVP 谱形一致性后投影: "
+            f"K={post_bilateral_configs['hvp'].get('k', 8)}, "
+            "distance_power="
+            f"{post_bilateral_configs['hvp']['distance_power']}, "
+            "anchor_strength="
+            f"{post_bilateral_configs['hvp']['anchor_strength']}, "
+            "target_beta="
+            f"{post_bilateral_configs['hvp']['target_beta']}。\n"
+            if post_bilateral_configs["hvp"] is not None
+            else ""
+        )
+        + (
+            "PDP 谱形一致性后投影: "
+            f"K={post_bilateral_configs['pdp'].get('k', 32)}, "
+            "distance_power="
+            f"{post_bilateral_configs['pdp']['distance_power']}, "
+            "anchor_strength="
+            f"{post_bilateral_configs['pdp']['anchor_strength']}, "
+            "target_beta="
+            f"{post_bilateral_configs['pdp']['target_beta']}。\n"
+            if post_bilateral_configs["pdp"] is not None
             else ""
         )
         + f"重建: {projection_order} 交替投影 "

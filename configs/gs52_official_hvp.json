@@ -1,0 +1,73 @@
+{
+  "name": "BLEND_GS52_OFFICIAL_HVP",
+  "tune_seeds": [
+    1890,
+    3716,
+    962,
+    1022
+  ],
+  "audit_seed": 2262,
+  "source": {
+    "kind": "anisotropic_idw",
+    "k": 16,
+    "radial_ratio": 5.0,
+    "distance_power": 2.0,
+    "amplitude": "equalized"
+  },
+  "complex_gate": {
+    "checkpoint": "checkpoints/complex_neighbor_mlp16_geomall_e300/selected.pt",
+    "alpha": 0.5,
+    "secondary_checkpoint": "checkpoints/complex_neighbor_set16_e300/selected.pt",
+    "secondary_alpha": 0.1
+  },
+  "phase": {
+    "k0_rad_per_meter": -140.25,
+    "k1_rad_per_meter_per_subcarrier": -0.0006250000000000006,
+    "global_phase": -0.05367748467163098
+  },
+  "steering": {
+    "layout": "phv",
+    "theta": 1.0191372632980347,
+    "horizontal_coefficient": 3.1500604152679443,
+    "vertical_coefficient": -25.401906967163086
+  },
+  "projection": {
+    "order": "pdp_hvp",
+    "iterations": 8,
+    "source_blend": 0.9,
+    "scale": 0.7336863048736063,
+    "residual_global_phase": -0.004638569749856284,
+    "phase_seed_epsilon": 0.001,
+    "score_pas_layout": "hvp",
+    "tune_median": 0.7514216311381448,
+    "audit": 0.7757315320785152,
+    "strict_audit": 0.8090239497600464
+  },
+  "pas": {
+    "k": 16,
+    "correction": 1.0,
+    "radial_multiplier": 0.45,
+    "tangent_multiplier": 1.0,
+    "blend": 0.8,
+    "transport": {
+      "k": 16,
+      "distance_power": 2.0,
+      "blend": 0.25,
+      "gate_checkpoint": "checkpoints/pas_transport_gate/selected.pt"
+    },
+    "hvp": {
+      "k": 32,
+      "correction": 0.5,
+      "radial_multiplier": 1.0,
+      "tangent_multiplier": 1.0,
+      "blend": 1.0
+    }
+  },
+  "pdp": {
+    "k": 32,
+    "correction": 0.8,
+    "radial_multiplier": 1.0,
+    "tangent_multiplier": 1.0,
+    "blend": 0.4
+  }
+}

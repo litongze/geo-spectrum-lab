@@ -14,7 +14,12 @@ from _bootstrap import ROOT  # noqa: F401
 from probe_full_array_steering_phase import array_steering_phase
 from score_holdout import reproduce_val_indices
 from wireless_twin.data.setup_config import load_setup
-from wireless_twin.signal import pas_spectrum_phv, pdp_spectrum
+from wireless_twin.signal import (
+    pas_spectrum,
+    pas_spectrum_phv,
+    pas_spectrum_pvh,
+    pdp_spectrum,
+)
 
 
 def stable_unit(value: torch.Tensor) -> torch.Tensor:
@@ -83,8 +88,23 @@ def main() -> None:
         "--expert-dir", default="cache/moment_attention_selected"
     )
     parser.add_argument("--domain", choices=("pas", "pdp"), required=True)
+    parser.add_argument(
+        "--pas-layout",
+        choices=("phv", "hvp", "pvh"),
+        default="phv",
+    )
+    parser.add_argument(
+        "--pas-expert-correction",
+        default="1",
+        help="correction suffix used by PAS expert artifacts",
+    )
     parser.add_argument("--tune-seeds", default="1890,3716,962,1022")
     parser.add_argument("--audit-seed", type=int, default=2262)
+    parser.add_argument(
+        "--strict-audit",
+        action="store_true",
+        help="score audit only on rows absent from every tune split",
+    )
     parser.add_argument("--external-indices")
     parser.add_argument("--external-name", default="testmatched")
     parser.add_argument("--k-values", default="8,16,32")
@@ -116,6 +136,12 @@ def main() -> None:
         int(value) for value in args.tune_seeds.split(",") if value
     ]
     split_keys: list[int | str] = tune_seeds + [args.audit_seed]
+    tune_union = set().union(
+        *[
+            set(reproduce_val_indices(2000, 0.1, seed))
+            for seed in tune_seeds
+        ]
+    )
     if args.external_indices:
         split_keys.append(args.external_name)
     k_values = [
@@ -181,16 +207,28 @@ def main() -> None:
     subcarrier = np.arange(spec.s, dtype=np.float64)
     subcarrier -= subcarrier.mean()
     device = torch.device(args.device)
+    pas_transform = {
+        "phv": pas_spectrum_phv,
+        "hvp": pas_spectrum,
+        "pvh": pas_spectrum_pvh,
+    }[args.pas_layout]
     sufficient: dict[str, dict[int | str, dict[str, float]]] = {}
 
     for split in split_keys:
-        val_idx = get_split_indices(
+        full_val_idx = get_split_indices(
             len(positions),
             split,
             args.external_name,
             args.external_indices,
         )
-        pool_idx = np.setdiff1d(all_idx, val_idx)
+        keep = np.ones(len(full_val_idx), dtype=bool)
+        if split == args.audit_seed and args.strict_audit:
+            keep = np.asarray(
+                [int(index) not in tune_union for index in full_val_idx],
+                dtype=bool,
+            )
+        val_idx = full_val_idx[keep]
+        pool_idx = np.setdiff1d(all_idx, full_val_idx)
         distance, local = cKDTree(positions[pool_idx, :2]).query(
             positions[val_idx, :2], k=k_max
         )
@@ -210,7 +248,7 @@ def main() -> None:
                 weight_bank[f"k{k}_p{power:g}"] = weight
 
         expert_name = (
-            f"pas_{split}_c1.npy"
+            f"pas_{split}_c{args.pas_expert_correction}.npy"
             if args.domain == "pas"
             else f"pdp_{split}_c0.8.npy"
         )
@@ -219,6 +257,9 @@ def main() -> None:
             dtype=torch.float32,
             device=device,
         )
+        expert = expert[
+            torch.as_tensor(keep, dtype=torch.bool, device=device)
+        ]
         expert = stable_unit(expert)
         split_sum: dict[str, float] = {}
         split_count: dict[str, int] = {}
@@ -248,7 +289,7 @@ def main() -> None:
                 )
                 if args.domain == "pas":
                     truth = stable_unit(
-                        pas_spectrum_phv(truth_h, spec)
+                        pas_transform(truth_h, spec)
                     )
                 else:
                     truth = stable_unit(pdp_spectrum(truth_h, spec))
@@ -281,6 +322,7 @@ def main() -> None:
                 ) in transport_variants:
                     if args.domain == "pas":
                         variant = dict(steering)
+                        variant["layout"] = args.pas_layout
                         variant["theta"] = (
                             float(variant["theta"]) + theta_offset
                         )
@@ -307,7 +349,7 @@ def main() -> None:
                             * steering_phase[..., None]
                         )
                         neighbor_spectrum = stable_unit(
-                            pas_spectrum_phv(
+                            pas_transform(
                                 moved.reshape(
                                     batch * k_max,
                                     spec.m,
@@ -449,8 +491,27 @@ def main() -> None:
             "config ranked on tune splits"
         ),
         "domain": args.domain,
+        "pas_layout": (
+            args.pas_layout if args.domain == "pas" else None
+        ),
         "tune_seeds": tune_seeds,
         "audit_seed": args.audit_seed,
+        "strict_audit": args.strict_audit,
+        "strict_audit_count": (
+            int(
+                sum(
+                    int(index) not in tune_union
+                    for index in get_split_indices(
+                        len(positions),
+                        args.audit_seed,
+                        args.external_name,
+                        args.external_indices,
+                    )
+                )
+            )
+            if args.strict_audit
+            else 200
+        ),
         "external_name": (
             args.external_name if args.external_indices else None
         ),

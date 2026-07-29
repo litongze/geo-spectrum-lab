@@ -17,7 +17,12 @@ from sweep_mapaware_spectrum_knn import map_features, robust_standardize
 from wireless_twin.data.map_loader import load_point_cloud
 from wireless_twin.data.setup_config import load_setup
 from wireless_twin.models.raytrace2 import build_heightmap
-from wireless_twin.signal import pas_spectrum_phv, pdp_spectrum
+from wireless_twin.signal import (
+    pas_spectrum,
+    pas_spectrum_phv,
+    pas_spectrum_pvh,
+    pdp_spectrum,
+)
 
 
 class LatentMLP(nn.Module):
@@ -44,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datadir", default="Round1_Map(2)")
     parser.add_argument("--cache-dir", default="cache/teammate_knn_hvp")
     parser.add_argument("--domain", choices=("pas", "pdp"), default="pas")
+    parser.add_argument(
+        "--pas-layout",
+        choices=("phv", "hvp", "pvh"),
+        default="phv",
+    )
     parser.add_argument("--split-seed", type=int, default=1890)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--hidden", type=int, default=256)
@@ -111,8 +121,19 @@ def main() -> None:
     )
 
     cache_dir = Path(args.cache_dir)
+    pas_transform = {
+        "phv": pas_spectrum_phv,
+        "hvp": pas_spectrum,
+        "pvh": pas_spectrum_pvh,
+    }[args.pas_layout]
     cache_name = (
-        "train_pas_phv.npy" if args.domain == "pas" else "train_pdp.npy"
+        {
+            "phv": "train_pas_phv.npy",
+            "hvp": "train_pas_hvp.npy",
+            "pvh": "train_pas_pvh.npy",
+        }[args.pas_layout]
+        if args.domain == "pas"
+        else "train_pdp.npy"
     )
     spectra_np = np.load(cache_dir / cache_name, mmap_mode="r")
     spectra = torch.as_tensor(
@@ -195,7 +216,7 @@ def main() -> None:
         device=device,
     )
     if args.domain == "pas":
-        baseline = pas_spectrum_phv(baseline_h, spec)
+        baseline = pas_transform(baseline_h, spec)
     else:
         baseline = pdp_spectrum(baseline_h, spec)
     baseline = baseline / baseline.norm(
@@ -309,6 +330,7 @@ def main() -> None:
         {
             **best_payload,
             "domain": args.domain,
+            "pas_layout": args.pas_layout,
             "split_seed": args.split_seed,
             "rank": args.rank,
             "hidden": args.hidden,
@@ -324,6 +346,7 @@ def main() -> None:
     )
     result = {
         "domain": args.domain,
+        "pas_layout": args.pas_layout,
         "split_seed": args.split_seed,
         "rank": args.rank,
         "pca_upper": pca_upper,

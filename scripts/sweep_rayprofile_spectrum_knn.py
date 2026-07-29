@@ -153,6 +153,93 @@ def local_radial_profiles(
     }
 
 
+def local_multiscale_radial_profiles(
+    positions: np.ndarray,
+    bs_position: np.ndarray,
+    heightmap: np.ndarray,
+    x0: float,
+    y0: float,
+    resolution: float,
+    directions: int = 16,
+    bin_edges: tuple[int, ...] = (0, 4, 8, 16, 32, 64),
+) -> dict[str, np.ndarray]:
+    """Describe local clutter in BS-relative angular and radial bins."""
+    if len(bin_edges) < 2 or bin_edges[0] != 0:
+        raise ValueError("bin_edges must start at zero and contain two values")
+    if any(right <= left for left, right in zip(bin_edges, bin_edges[1:])):
+        raise ValueError("bin_edges must be strictly increasing")
+
+    radius = bin_edges[-1]
+    base_angle = np.arctan2(
+        positions[:, 1] - bs_position[1],
+        positions[:, 0] - bs_position[0],
+    )
+    angle = base_angle[:, None] + np.linspace(
+        0.0, 2.0 * np.pi, directions, endpoint=False
+    )[None]
+    distance = np.arange(1, radius + 1, dtype=np.float32)
+    px = (
+        positions[:, None, None, 0]
+        + np.cos(angle)[:, :, None] * distance[None, None]
+    )
+    py = (
+        positions[:, None, None, 1]
+        + np.sin(angle)[:, :, None] * distance[None, None]
+    )
+    gx = np.clip(
+        ((px - x0) / resolution).astype(np.int64),
+        0,
+        heightmap.shape[0] - 1,
+    )
+    gy = np.clip(
+        ((py - y0) / resolution).astype(np.int64),
+        0,
+        heightmap.shape[1] - 1,
+    )
+    sampled_height = heightmap[gx, gy].astype(np.float32)
+    height_scale = (
+        np.quantile(sampled_height[sampled_height > 0], 0.75)
+        if np.any(sampled_height > 0)
+        else 1.0
+    )
+    normalized_height = np.clip(
+        sampled_height / max(height_scale, 1e-3), 0, 4
+    )
+    occupied = sampled_height > 2.0
+
+    maximum_bins = []
+    mean_bins = []
+    occupancy_bins = []
+    for left, right in zip(bin_edges, bin_edges[1:]):
+        segment = normalized_height[..., left:right]
+        maximum_bins.append(segment.max(axis=-1))
+        mean_bins.append(segment.mean(axis=-1))
+        occupancy_bins.append(
+            occupied[..., left:right].mean(axis=-1)
+        )
+
+    maximum = np.stack(maximum_bins, axis=-1).reshape(
+        len(positions), -1
+    ).astype(np.float32)
+    mean = np.stack(mean_bins, axis=-1).reshape(
+        len(positions), -1
+    ).astype(np.float32)
+    occupancy = np.stack(occupancy_bins, axis=-1).reshape(
+        len(positions), -1
+    ).astype(np.float32)
+    return {
+        "radial_multiscale_height": maximum,
+        "radial_multiscale_mean": mean,
+        "radial_multiscale_occupancy": occupancy,
+        "radial_multiscale_height_occupancy": np.concatenate(
+            [maximum, occupancy], axis=1
+        ).astype(np.float32),
+        "radial_multiscale_all": np.concatenate(
+            [maximum, mean, occupancy], axis=1
+        ).astype(np.float32),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datadir", default="Round1_Map(2)")
