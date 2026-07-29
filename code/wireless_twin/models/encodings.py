@@ -28,9 +28,6 @@ class FourierFeatures(nn.Module):
         self.in_dim = in_dim
         self.n_freqs = n_freqs
         self.include_input = include_input
-        self.layout = "axis"
-        self.frequency_multiplier = 1.0
-        self.input_last = False
         freqs = 2.0 ** torch.arange(n_freqs) * math.pi
         self.register_buffer("freqs", freqs, persistent=False)
 
@@ -41,30 +38,9 @@ class FourierFeatures(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, in_dim) -> (B, in_dim, n_freqs)
-        scaled = x.unsqueeze(-1) * self.freqs * self.frequency_multiplier
-        sine, cosine = scaled.sin(), scaled.cos()
-        if self.layout == "frequency":
-            enc = torch.cat(
-                [sine.permute(0, 2, 1), cosine.permute(0, 2, 1)],
-                dim=-1,
-            ).reshape(x.shape[0], -1)
-        elif self.layout == "pair":
-            enc = torch.stack([sine, cosine], dim=-1).reshape(
-                x.shape[0], -1
-            )
-        elif self.layout == "trig":
-            enc = torch.cat(
-                [sine.reshape(x.shape[0], -1), cosine.reshape(x.shape[0], -1)],
-                dim=-1,
-            )
-        else:
-            enc = torch.cat([sine, cosine], dim=-1).reshape(
-                x.shape[0], -1
-            )
+        scaled = x.unsqueeze(-1) * self.freqs
+        enc = torch.cat([scaled.sin(), scaled.cos()], dim=-1)  # (B,in_dim,2F)
+        enc = enc.reshape(x.shape[0], -1)
         if self.include_input:
-            enc = (
-                torch.cat([enc, x], dim=-1)
-                if self.input_last
-                else torch.cat([x, enc], dim=-1)
-            )
+            enc = torch.cat([x, enc], dim=-1)
         return enc

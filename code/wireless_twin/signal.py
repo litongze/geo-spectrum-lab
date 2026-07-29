@@ -8,8 +8,8 @@ and are imported by :mod:`wireless_twin.training.losses` and
 Definitions (task book §2.2)
 ----------------------------
 * **PAS** — Power Angle Spectrum on the BS side.  The BS array ``M = MH*MV*MP``
-  is reshaped as ``(MH, MV, MP)``. A 2-D spatial FFT transforms the
-  ``(MH, MV)`` grid and power is summed over ``MP``. One PAS vector
+  is transformed to the angular domain with a 2-D spatial FFT over the
+  (MH, MV) grid; power is summed over the ``MP`` polarisations.  One PAS vector
   (length ``MH*MV``) is produced per (position, UE-antenna ``n``, sub-carrier
   ``s``).
 * **PDP** — Power Delay Profile on the BS side.  An inverse FFT over the ``S``
@@ -41,43 +41,13 @@ def pas_spectrum(h: torch.Tensor, spec: ChannelSpec) -> torch.Tensor:
     """
     b = h.shape[0]
     hm = h.reshape(b, spec.mh, spec.mv, spec.mp, spec.n, spec.s)
+    # 2-D spatial FFT over the BS antenna grid (rows, cols)
     hf = torch.fft.fft2(hm, dim=(1, 2))
     power = hf.real ** 2 + hf.imag ** 2                 # |.|^2
     power = power.sum(dim=3)                            # sum polarisations -> (B,MH,MV,N,S)
     a = spec.mh * spec.mv
     pas = power.reshape(b, a, spec.n, spec.s)           # (B, A, N, S)
     return pas.permute(0, 2, 3, 1).contiguous()        # (B, N, S, A)
-
-
-def pas_spectrum_pvh(
-    h: torch.Tensor, spec: ChannelSpec
-) -> torch.Tensor:
-    """Experimental ``(MP, MV, MH)`` layout retained for artifact comparison."""
-    b = h.shape[0]
-    hm = h.reshape(b, spec.mp, spec.mv, spec.mh, spec.n, spec.s)
-    power = torch.fft.fft2(hm, dim=(2, 3)).abs().square().sum(dim=1)
-    return power.reshape(
-        b, spec.mh * spec.mv, spec.n, spec.s
-    ).permute(0, 2, 3, 1).contiguous()
-
-
-def pas_spectrum_phv(
-    h: torch.Tensor, spec: ChannelSpec
-) -> torch.Tensor:
-    """Experimental ``(MP, MH, MV)`` layout for polarization-first data."""
-    b = h.shape[0]
-    hm = h.reshape(b, spec.mp, spec.mh, spec.mv, spec.n, spec.s)
-    power = torch.fft.fft2(hm, dim=(2, 3)).abs().square().sum(dim=1)
-    return power.reshape(
-        b, spec.mh * spec.mv, spec.n, spec.s
-    ).permute(0, 2, 3, 1).contiguous()
-
-
-def pas_spectrum_legacy_hvp(
-    h: torch.Tensor, spec: ChannelSpec
-) -> torch.Tensor:
-    """Compatibility alias for the online-validated ``(MH, MV, MP)`` layout."""
-    return pas_spectrum(h, spec)
 
 
 def pdp_spectrum(h: torch.Tensor, spec: ChannelSpec) -> torch.Tensor:
@@ -96,21 +66,21 @@ def pdp_spectrum(h: torch.Tensor, spec: ChannelSpec) -> torch.Tensor:
     return hd.real ** 2 + hd.imag ** 2
 
 
-def cosine_similarity_along_last(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+def cosine_similarity_along_last(pred: torch.Tensor, gt: torch.Tensor,
+                                 zero_denominator: float = 1e-12) -> torch.Tensor:
     """Mean cosine similarity between vectors on the last axis.
 
     ``pred`` and ``gt`` share shape ``(..., L)``.  Cosine similarity is computed
     per length-``L`` vector and averaged over every leading axis, matching the
     task book's "average over all positions / antennas / sub-carriers".
-
-    Note: the denominator is floored at the dtype's smallest positive value
-    (not a fixed ``1e-12``) so the metric stays correct for *raw*-scale channels
-    whose power spectra are ~1e-13; a fixed eps would swamp the denominator and
-    collapse the cosine to zero.
     """
     num = (pred * gt).sum(dim=-1)
-    den = pred.norm(dim=-1) * gt.norm(dim=-1)
-    den = torch.clamp_min(den, torch.finfo(den.dtype).tiny)
-    # Cauchy-Schwarz: a true cosine is in [-1, 1]; clamp guards float underflow
-    # on near-zero spectra (e.g. a degenerate model) from exploding the ratio.
-    return (num / den).clamp(-1.0, 1.0).mean()
+    pred_sq = pred.square().sum(dim=-1)
+    gt_sq = gt.square().sum(dim=-1)
+    nonzero = (pred_sq != 0) & (gt_sq != 0)
+    safe_pred_sq = torch.where(nonzero, pred_sq, pred_sq.new_ones(pred_sq.shape))
+    safe_gt_sq = torch.where(nonzero, gt_sq, gt_sq.new_ones(gt_sq.shape))
+    den = torch.sqrt(safe_pred_sq) * torch.sqrt(safe_gt_sq)
+    den = torch.where(nonzero, den, den.new_full(den.shape, zero_denominator))
+    similarity = torch.where(nonzero, num / den, num.new_zeros(num.shape))
+    return similarity.mean()

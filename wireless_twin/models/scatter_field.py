@@ -62,6 +62,8 @@ class ScatterFieldModel(ChannelModel):
         n_attn_heads: int = 0,   # >0: multi-head cross-attention visibility gate
         attn_dim: int = 32,
         u_rank: int = 0,         # >0: low-rank BS signature U=C@B (shared basis)
+        structured_u2: bool = False,  # fitted-constant steering U (150deg/1.0lambda) + learnable v-pattern
+        u2_rank: int = 0,        # >0 with structured_u2: low-rank free modulation on top of steering
         in_dim: int = 3,   # accepted for API symmetry; raw xyz expected
     ) -> None:
         super().__init__(spec)
@@ -76,6 +78,8 @@ class ScatterFieldModel(ChannelModel):
         self.n_attn_heads = n_attn_heads
         self.attn_dim = attn_dim
         self.u_rank = u_rank
+        self.structured_u2 = structured_u2
+        self.u2_rank = u2_rank
         # extra input dims beyond xyz are ray-traced map-context features
         # (LoS-to-BS blockage + directional openness) -> condition occlusion
         self.map_dim = max(0, int(in_dim) - 3)
@@ -114,6 +118,19 @@ class ScatterFieldModel(ChannelModel):
             self.register_buffer("mv_idx", torch.arange(self.mv, dtype=torch.float32))
             self.log_kappa_bs = nn.Parameter(torch.zeros(()))   # electrical size
             self.pol = _ComplexVec(self.mp)                     # polarisation gains
+        elif structured_u2:
+            # fitted array: boresight 150deg, horizontal 1.0*lambda, sign -1 (93% LoS-bin hit).
+            # steering is GEOMETRIC (from scatterer az/el); only shared params learned.
+            self.psi = nn.Parameter(torch.tensor(150.0 * np.pi / 180))
+            self.sh = nn.Parameter(torch.tensor(-2.0 * np.pi))        # 1.0 lambda, sign -1
+            self.EB = 32
+            self.vpat = nn.Parameter(torch.randn(self.EB, self.mv, 2) * 0.3)
+            self.pol2 = _ComplexVec(self.k, self.mp)                   # per-scatterer pol pair
+            self.register_buffer("mh_i2", torch.arange(self.mh, dtype=torch.float32))
+            if u2_rank > 0:   # steering-aligned low-rank deviation (init ~identity)
+                self.u2c = _ComplexVec(self.k, u2_rank)
+                self.u2b = _ComplexVec(u2_rank, spec.m)
+            self.lobe = nn.Parameter(torch.full((self.k, 2), 3.0))  # softplus->taper宽度(元素数)
         elif u_rank > 0:
             self.u_c = _ComplexVec(self.k, u_rank)   # (K,r) per-scatterer coeffs
             self.u_b = _ComplexVec(u_rank, m)         # (r,M) shared angular basis
@@ -255,6 +272,29 @@ class ScatterFieldModel(ChannelModel):
     def _bs_signature(self, scat: torch.Tensor) -> torch.Tensor:
         """BS array signature U_k: free-learned, or geometric steering toward p_k."""
         if not self.structured_u:
+            if self.structured_u2:
+                rel = scat - self.bs
+                rn = torch.linalg.norm(rel, dim=1).clamp_min(1e-3)
+                ah = torch.stack([-torch.sin(self.psi), torch.cos(self.psi),
+                                  torch.zeros((), device=rel.device)])
+                u = (rel / rn[:, None] * ah[None]).sum(-1)             # (K,) 方位余弦
+                wz = rel[:, 2] / rn                                     # (K,) 仰角余弦
+                stH = torch.exp(1j * (self.sh * u[:, None] * self.mh_i2))   # (K,MH)
+                eb = ((wz + 1) / 2 * (self.EB - 1)).clamp(0, self.EB - 1)
+                lo = eb.floor().long(); hi = (lo + 1).clamp(max=self.EB - 1)
+                fr = (eb - lo.float())[:, None]
+                pat = torch.view_as_complex(self.vpat)                  # (EB,MV)
+                stV = pat[lo] * (1 - fr) + pat[hi] * fr                 # (K,MV)
+                wh = torch.nn.functional.softplus(self.lobe[:, 0:1]) * self.mh
+                wv = torch.nn.functional.softplus(self.lobe[:, 1:2]) * self.mv
+                th = torch.exp(-((self.mh_i2[None] - (self.mh-1)/2)/wh)**2)
+                tv_i = torch.arange(self.mv, device=wh.device, dtype=torch.float32)
+                tv = torch.exp(-((tv_i[None] - (self.mv-1)/2)/wv)**2)
+                U = ((stH*th)[:, :, None, None] * (stV*tv)[:, None, :, None]
+                     * self.pol2()[:, None, None, :]).reshape(self.k, self.spec.m)
+                if self.u2_rank > 0:
+                    U = U * (1 + self.u2c() @ self.u2b())
+                return U                                                  # (K, MH*MV*MP)
             if self.u_rank > 0:
                 return self.u_c() @ self.u_b()          # (K,r)@(r,M) -> (K,M)
             return self.u()

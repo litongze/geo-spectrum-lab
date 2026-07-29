@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -24,6 +25,7 @@ from wireless_twin.data.setup_config import ChannelSpec
 from wireless_twin.evaluation.metrics import evaluate_channels
 from wireless_twin.evaluation.predictor import predict_test_channels
 from wireless_twin.models import build_model
+from wireless_twin.signal import pas_spectrum, pas_spectrum_pvh
 from wireless_twin.training import TrainConfig, Trainer
 
 
@@ -38,6 +40,26 @@ def _make_data(spec, n, seed=0):
     gains = np.exp(1j * (pos @ freqs.T))
     ch = np.einsum("pk,km,kn,ks->pmns", gains, u, v, w).astype(np.complex64)
     return pos, ch
+
+
+def test_pas_antenna_layout():
+    spec = ChannelSpec(m=12, mh=3, mv=2, mp=2, n=1, nh=1, nv=1, np=1, s=1,
+                       bs_position=[0, 0, 0], metric_weights=[0.4, 0.4, 0.2])
+    values = torch.arange(1, 13, dtype=torch.float32)
+    h = torch.complex(values, values.square()).reshape(1, 12, 1, 1)
+
+    planes = h.reshape(1, spec.mh, spec.mv, spec.mp, spec.n, spec.s)
+    expected = (
+        torch.fft.fft2(planes, dim=(1, 2))
+        .abs().square().sum(dim=3)
+        .reshape(1, spec.mh * spec.mv, spec.n, spec.s)
+        .permute(0, 2, 3, 1)
+    )
+
+    actual = pas_spectrum(h, spec)
+    experimental = pas_spectrum_pvh(h, spec)
+    assert torch.allclose(actual, expected)
+    assert not torch.allclose(actual, experimental)
 
 
 def test_pipeline():
@@ -93,5 +115,6 @@ def test_pipeline():
 
 
 if __name__ == "__main__":
+    test_pas_antenna_layout()
     test_pipeline()
     print("OK: end-to-end pipeline smoke test passed.")

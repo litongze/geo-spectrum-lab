@@ -1,0 +1,34 @@
+{
+  "tune_seeds": [
+    1890,
+    3716,
+    962,
+    1022
+  ],
+  "audit_seed": 2262,
+  "phase": {
+    "k0_rad_per_meter": -140.25,
+    "k1_rad_per_meter_per_subcarrier": -0.0006250000000000006,
+    "global_phase": -0.1612516831134712
+  },
+  "projection": {
+    "order": "pas_pdp",
+    "iterations": 8,
+    "scale": 0.36046905573096444,
+    "phase_seed_epsilon": 0.001
+  },
+  "pas": {
+    "k": 16,
+    "correction": 1.0,
+    "radial_multiplier": 0.45,
+    "tangent_multiplier": 1.0,
+    "blend": 0.8
+  },
+  "pdp": {
+    "k": 32,
+    "correction": 0.8,
+    "radial_multiplier": 1.0,
+    "tangent_multiplier": 1.0,
+    "blend": 0.3
+  }
+}

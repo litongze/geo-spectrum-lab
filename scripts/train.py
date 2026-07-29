@@ -100,6 +100,7 @@ def main() -> None:
 
     tcfg = TrainConfig(**{k: v for k, v in train_cfg.items()
                           if k in TrainConfig.__dataclass_fields__})
+    split_seed = tcfg.seed if tcfg.split_seed < 0 else tcfg.split_seed
 
     meta = {
         "model_name": model_name,
@@ -112,6 +113,9 @@ def main() -> None:
         "use_bs_geometry": use_geo,
         "use_map_features": use_map,
         "map_file": str(Path(datadir) / f"{rd.round_tag}_Map.ply") if use_map else None,
+        "train_config": asdict(tcfg),
+        "split_seed": split_seed,
+        "val_fraction": tcfg.val_fraction,
     }
 
     trainer = Trainer(model, rd.train, tcfg, checkpoint_meta=meta)

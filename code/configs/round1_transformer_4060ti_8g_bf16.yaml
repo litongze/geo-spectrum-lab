@@ -1,0 +1,57 @@
+# RTX 4060 Ti 8GB: numerically safer BF16 configuration.
+# Verify support first: python -c "import torch; print(torch.cuda.is_bf16_supported())"
+data:
+  datadir: data/Data1
+  scaler_mode: std
+  use_map: true
+  mmap_channels: true
+  eager_targets: false
+
+model:
+  name: transformer
+  d_model: 160
+  n_heads: 8
+  n_freqs: 10
+  n_latents: 64
+  perceiver_layers: 4
+  scene_layers: 3
+  scene_inducing: 64
+  n_scene_latents: 128
+  decoder_layers: 1
+  decoder_self_attention: false
+  channel_rank: 32
+  ff_mult: 4
+  dropout: 0.1
+  n_map_points: 8192
+  n_scene_tokens: 256
+  scene_knn: 16
+  scene_seed: 0
+  cache_scene_in_eval: true
+
+train:
+  epochs: 300
+  batch_size: 1
+  accumulate_steps: 8
+  lr: 2.0e-4
+  min_lr_ratio: 0.05
+  warmup_epochs: 10
+  weight_decay: 1.0e-4
+  lambda_nmse: 20.0
+  lambda_pas: 1.0
+  lambda_pdp: 1.0
+  lambda_sparse: 1.0e-6
+  nmse_mode: dataset
+  val_fraction: 0.1
+  val_split_mode: spatial
+  val_regions: 4
+  position_noise_std: 0.01
+  grad_clip: 1.0
+  num_workers: 0
+  precision: bf16
+  pin_memory: true
+  early_stopping_patience: 50
+  log_every: 1
+  seed: 2026
+
+output:
+  ckpt: checkpoints/round1_transformer_4060ti_8g_bf16.pt

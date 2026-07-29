@@ -73,6 +73,9 @@ def main():
                     help="drop the NMSE term from the TRAIN loss (keeps shape)")
     ap.add_argument("--train-scale", type=float, default=0.0,
                     help="physical scale for the train loss (0=gt RMS)")
+    ap.add_argument("--split-seed", type=int, default=0,
+                    help="validation split seed to hold out during fine-tuning")
+    ap.add_argument("--val-fraction", type=float, default=0.1)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     dev = args.device
@@ -88,7 +91,7 @@ def main():
     d = Path(args.datadir); tag = meta["round_tag"]
     pos = np.load(d / f"{tag}_Train_Pos.npy").astype(np.float32)
     ch = np.load(d / f"{tag}_Train_Channel.npy")
-    vi = set(reproduce_val_indices(len(pos), 0.1, 0))
+    vi = set(reproduce_val_indices(len(pos), args.val_fraction, args.split_seed))
     tr = np.array([i for i in range(len(pos)) if i not in vi])
     va = np.array(sorted(vi))
     # build model input features exactly like predict_test_channels (so map /
@@ -165,6 +168,20 @@ def main():
     if best_state is not None:
         model.load_state_dict({k: v.to(dev) for k, v in best_state.items()})
     payload["model_state"] = {k: v.cpu() for k, v in model.state_dict().items()}
+    payload.setdefault("meta", meta)
+    payload["meta"]["finetune_epscap"] = {
+        "split_seed": args.split_seed,
+        "val_fraction": args.val_fraction,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "eps": args.eps,
+        "no_c3": bool(args.no_c3),
+        "train_scale": args.train_scale,
+        "best_real_C": best,
+    }
+    payload["meta"]["split_seed"] = args.split_seed
+    payload["meta"]["val_fraction"] = args.val_fraction
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, args.out)
     print(f"[epscap] saved {args.out} best real-C={best:.4f}", flush=True)
 
